@@ -33,6 +33,8 @@ Use `orgraft <command> --help` for the live interface contract.
 `orgraft workflow` coordinates project folders, manual checkpoints, and
 validation rounds. It does not replace the core algorithms in
 `recruit/asm/resolve/polish/rebuild`; it strings them together from one config.
+For multi-case configs, the generated master script runs the shared recruit
+stage once, then calls case scripts for draft assembly through rebuild.
 
 ```bash
 orgraft workflow template
