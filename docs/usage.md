@@ -36,7 +36,7 @@ validation rounds. It does not replace the core algorithms in
 
 ```bash
 orgraft workflow template
-orgraft workflow init --command-mode classic --out results_workflow/orgraft.workflow.toml
+orgraft workflow init --out results_workflow/orgraft.workflow.toml
 orgraft workflow plan --config results_workflow/orgraft.workflow.toml
 orgraft workflow run-script --config results_workflow/orgraft.workflow.toml
 orgraft workflow run --config results_workflow/orgraft.workflow.toml
@@ -58,12 +58,8 @@ orgraft workflow test-fake-validate --input-fasta ERROR_POLISH_ALN.fasta --pos-r
 The workflow file is TOML. Generate a starter file instead of hand-writing it:
 
 ```bash
-orgraft workflow init --command-mode classic --out results_workflow/orgraft.workflow.toml
+orgraft workflow init --out results_workflow/orgraft.workflow.toml
 ```
-
-Use `--command-mode detailed` to include file handoff and optional-argument
-notes in generated scripts, or `--command-mode concise` to emit one case-level
-`orgraft workflow run` command.
 
 Minimal shape:
 
@@ -79,10 +75,6 @@ soft_paths = "soft_paths.txt"
 
 [workflow]
 mode = "stepwise"
-# detailed: expanded commands plus file handoffs and common optional arguments.
-# classic: expanded commands with the classic required argument set.
-# concise: one case-level `orgraft workflow run` command per generated script.
-command_mode = "classic"
 max_rounds = 3
 threads = 64
 force = false
@@ -106,8 +98,30 @@ out_dir = "${results_dir}/02.draft_asm"
 threads = 8
 # profile = "standard"
 
+[commands.resolve]
+out_dir = "${results_dir}/03.resolve_gfa"
+# gfa_editor_mode = "rust"
+# max_states = 5000
+# max_candidates = 100
+
 [commands.polish]
+out_dir = "${results_dir}/04.polish"
 threads = 64
+# per_read_variant_calls = true
+# snv_indel_overlap_policy = "mark-overlap"
+# plot_range = "1-50000"
+# plot_dpi = 300
+# plot_output_format = "png"
+# coverage_plot_rasterize = true
+# snv_indel_plot_rasterize = true
+# sv_plot_highlight_subgroups = "subgraph_001:0"
+# sv_plot_highlight_read_ids = "/path/to/read_ids.txt"
+# sv_plot_highlight_min_fraction = 0.005
+# sv_plot_highlight_min_reads = 10
+# snv_indel_plot_low_confidence = "non-high"
+# snv_indel_plot_low_min_reads = 3
+# snv_indel_plot_low_min_fraction = 0
+# snv_indel_plot_high_risk_fraction = 0.5
 
 [commands.rebuild]
 enabled = true
@@ -122,11 +136,11 @@ subgraph = "subgraph_001"
 workflow_dir = "${results_dir}/workflow/${organelle}/${subgraph}"
 draft_graph = "${results_dir}/02.draft_asm/${organelle}/03.finalize_graph/graph.gfa"
 checked_draft_gfa = "${results_dir}/workflow/${organelle}/${subgraph}/checkpoint_1/checked_draft.gfa"
-resolve_out_dir = "${results_dir}/03.resolve_gfa"
+# resolve_out_dir defaults to commands.resolve.out_dir
 reads = "${results_dir}/01.recruit/${organelle}.fastq.gz"
-linearized_fasta = "${results_dir}/03.resolve_gfa/${organelle}/fasta/resolved_subgraphs.fasta"
-polish_reference = "${results_dir}/03.resolve_gfa/${organelle}/fasta/rotated_reference.fasta"
-polish_out_dir = "${results_dir}/04.polish"
+# linearized_fasta defaults to commands.resolve.out_dir/${organelle}/fasta/resolved_subgraphs.fasta
+# polish_reference defaults to commands.resolve.out_dir/${organelle}/fasta/rotated_reference.fasta
+# polish_out_dir defaults to commands.polish.out_dir
 rebuild_out_dir = "${results_dir}/05.rebuild/${organelle}"
 ```
 
@@ -154,11 +168,15 @@ enabled = false
 [commands.asm]
 enabled = false
 
+[commands.resolve]
+out_dir = "${results_dir}/03.resolve_gfa"
+
+[commands.polish]
+out_dir = "${results_dir}/04.polish"
+
 [workflow.case.mito_subgraph_001]
 draft_graph = "${source_results_dir}/draft_asm/${organelle}/03.finalize_graph/graph.gfa"
 reads = "${source_results_dir}/recruit/${organelle}.fastq.gz"
-resolve_out_dir = "${results_dir}/03.resolve_gfa"
-polish_out_dir = "${results_dir}/04.polish"
 rebuild_out_dir = "${results_dir}/05.rebuild/${organelle}"
 ```
 
