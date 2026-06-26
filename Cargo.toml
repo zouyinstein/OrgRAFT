@@ -1,0 +1,14 @@
+[package]
+name = "orgraft"
+version = "0.3.0"
+edition = "2021"
+description = "Organelle Graph Read-backed Assembly and FASTA Traceability"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "orgraft"
+path = "src/main.rs"
