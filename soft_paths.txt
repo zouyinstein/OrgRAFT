@@ -1,0 +1,7 @@
+# OrgRAFT local software paths for Darwin arm64.
+# Format: software_name<TAB>absolute_path_to_executable
+python	/Users/zouyinstein-m4max/Documents/Codex/hifisr-dev/hifisr/.venv/bin/python
+minimap2	/opt/homebrew/bin/minimap2
+blastn	/opt/homebrew/bin/blastn
+pigz	/opt/homebrew/bin/pigz
+gfa_editor_cli	/Users/zouyinstein-m4max/Documents/Codex/GFA_Editor/scripts/gfa_editor_cli.py

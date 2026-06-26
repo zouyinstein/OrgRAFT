@@ -4,7 +4,5 @@
 *.log
 *.tmp
 .DS_Store
-requirements.txt
-soft_paths.txt
 results
 orgraft
