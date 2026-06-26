@@ -17,26 +17,34 @@ Usage:
   orgraft workflow <command> [options]
 
 Commands:
-  template       print a workflow TOML template
-  init           write a workflow TOML template
-  plan           write runnable commands from a workflow config
-  run-script     generate the runnable command script, then execute it with bash
-  run            execute the automatic workflow directly inside orgraft
-  runtime-summary
-                 write results_dir/runtime_summary.md from existing workflow outputs
-  checkpoint1    check draft graph topology and write checked_draft.gfa when simple
-  checkpoint2    check SV/SNV-InDel evidence and prepare the next polish round
-  correct        apply a pos/ref/alt table to one FASTA record
-  test-correction
-                 run correction on explicit fake/reference files under results_workflow
-  test-fake-validate
-                 simulate validate failure from an explicit swapped polish_aln FASTA
+  template            print workflow TOML template
+  init                write workflow TOML template
+
+Template/init options:
+    --sample NAME       project sample [sample_001]
+    --results-dir DIR   output root [results_workflow]
+    --soft-paths FILE   tool paths [soft_paths.txt]
+    --command-mode MODE classic|detailed|concise [classic]
+    modes: classic expands stages; detailed adds handoff/options; concise calls workflow run
+
+Workflow commands:
+  plan                write runnable commands from workflow config
+  run-script          generate command script, then execute it with bash
+  run                 execute automatic workflow inside orgraft
+  runtime-summary     write results_dir/runtime_summary.md
+
+Checkpoint/test commands:
+  checkpoint1         check topology and write checked_draft.gfa when simple
+  checkpoint2         check SV/SNV-InDel evidence and prepare next polish round
+  correct             apply pos/ref/alt table to one FASTA record
+  test-correction     smoke test FASTA correction with explicit inputs
+  test-fake-validate  simulate validate failure from swapped polish_aln FASTA
 
 Common options:
-  --config FILE  workflow config [orgraft.workflow.toml]
-  --case NAME    select one workflow.case section
-  --round N      validation correction round for checkpoint2 [1]
-  --force        overwrite generated checkpoint/correction outputs
+  --config FILE       workflow config [orgraft.workflow.toml]
+  --case NAME         select one workflow.case section
+  --round N           checkpoint2 validation/correction round [1]
+  --force             overwrite generated checkpoint/correction outputs
 
 The workflow layer is intentionally thin: resolve/polish/rebuild own their core
 algorithms; workflow owns config parsing, project layout, run-command generation,
@@ -84,12 +92,14 @@ struct WorkflowConfig {
     results_dir: PathBuf,
     soft_paths: PathBuf,
     mode: String,
+    command_mode: WorkflowCommandMode,
     max_rounds: usize,
     threads: usize,
     force: bool,
     auto_snv_indel_correction: bool,
     recruit: WorkflowRecruitConfig,
     asm: WorkflowAsmConfig,
+    polish: WorkflowPolishConfig,
     rebuild: WorkflowRebuildConfig,
     topology_simple_allowed_classes: BTreeSet<String>,
     cases: Vec<WorkflowCase>,
@@ -124,6 +134,7 @@ struct WorkflowRecruitConfig {
     enabled: bool,
     reads: Option<PathBuf>,
     out_dir: PathBuf,
+    threads: Option<usize>,
     baits: Vec<(String, PathBuf)>,
     prefix: Option<String>,
     bait_format: Option<String>,
@@ -155,6 +166,7 @@ struct WorkflowRecruitConfig {
 struct WorkflowAsmConfig {
     enabled: bool,
     out_dir: PathBuf,
+    threads: Option<usize>,
     profile: Option<String>,
     stable: bool,
     min_graph_coverage: Option<u32>,
@@ -165,6 +177,11 @@ struct WorkflowAsmConfig {
     subsets: Option<String>,
     keep_debug_files: bool,
     extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowPolishConfig {
+    threads: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +197,34 @@ struct WorkflowRebuildConfig {
     blastn: Option<PathBuf>,
     keep_debug: bool,
     extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowCommandMode {
+    Detailed,
+    Classic,
+    Concise,
+}
+
+impl WorkflowCommandMode {
+    fn parse(value: &str) -> Result<Self, OrgraftError> {
+        match value {
+            "detailed" | "detail" | "full" => Ok(Self::Detailed),
+            "classic" | "standard" | "expanded" | "basic" | "stepwise" => Ok(Self::Classic),
+            "concise" | "simple" | "short" | "compact" => Ok(Self::Concise),
+            other => Err(OrgraftError::InvalidArgument(format!(
+                "unknown workflow command_mode `{other}`; expected detailed, classic, or concise"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detailed => "detailed",
+            Self::Classic => "classic",
+            Self::Concise => "concise",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,10 +284,13 @@ struct TemplateOptions {
     sample: String,
     results_dir: String,
     soft_paths: String,
+    command_mode: WorkflowCommandMode,
 }
 
 impl TemplateOptions {
     fn from_args(args: &[String]) -> Result<Self, OrgraftError> {
+        let command_mode =
+            WorkflowCommandMode::parse(option_value(args, "--command-mode")?.unwrap_or("classic"))?;
         Ok(Self {
             sample: option_value(args, "--sample")?
                 .unwrap_or("sample_001")
@@ -253,6 +301,7 @@ impl TemplateOptions {
             soft_paths: option_value(args, "--soft-paths")?
                 .unwrap_or("soft_paths.txt")
                 .to_string(),
+            command_mode,
         })
     }
 }
@@ -279,6 +328,7 @@ fn workflow_config_template(options: &TemplateOptions) -> String {
     let sample = toml_string(&options.sample);
     let results_dir = toml_string(&options.results_dir);
     let soft_paths = toml_string(&options.soft_paths);
+    let command_mode = toml_string(options.command_mode.as_str());
 
     format!(
         r#"# OrgRAFT workflow configuration.
@@ -295,8 +345,13 @@ soft_paths = {soft_paths}
 # stepwise: generate/check files, then let an external batch runner call commands.
 # automatic: `orgraft workflow run` may execute resolve/polish rounds directly.
 mode = "stepwise"
+# detailed: expanded stage commands, file handoffs, and common optional arguments.
+# classic: expanded stage commands with classic required arguments only.
+# concise: one case-level `orgraft workflow run` command.
+command_mode = {command_mode}
 max_rounds = 3
-threads = 8
+# Fallback when a command-specific threads value is omitted.
+threads = 64
 force = false
 # When true, checkpoint2 applies high-confidence SNV/InDel rows to make the next
 # polish input. Set false when `sv_snv_indel_summary.tsv status=pass` should be
@@ -311,17 +366,19 @@ topology_simple_allowed_classes = "0-0,0-1/1-0,1-1,1-2/2-1,2-2"
 enabled = true
 raw_reads = "/path/to/raw_hifi.fastq.gz"
 baits = "mito=/path/to/mito.fasta,plastid=/path/to/plastid.fasta"
-out_dir = "${{results_dir}}/recruit"
-platform = "HiFi"
-bait_format = "auto"
-gzip_output = true
-# max_reads = "mito,500000;plastid,500000"
+out_dir = "${{results_dir}}/01.recruit"
+threads = 16
+# platform = "HiFi"
+# bait_format = "auto"
+# gzip_output = true
+# max_reads = "all,20000"
 # extra_args = "--write-read-classification --write-sampled-ids"
 
 [commands.asm]
 enabled = true
-out_dir = "${{results_dir}}/draft_asm"
-profile = "standard"
+out_dir = "${{results_dir}}/02.draft_asm"
+threads = 8
+# profile = "standard"
 # stable = true
 # min_graph_coverage = 18
 # min_branch_ratio = 0.30
@@ -331,16 +388,19 @@ profile = "standard"
 # subsets = "3,5,10"
 # keep_debug_files = true
 
+[commands.polish]
+threads = 64
+
 [commands.rebuild]
 enabled = true
-out_dir = "${{results_dir}}/rebuild"
-threads = 4
+out_dir = "${{results_dir}}/05.rebuild"
+threads = 16
 # The generated workflow script passes the final checkpoint2 polished FASTA to
 # rebuild automatically. Set edited_gfa/polished_fasta only for standalone
 # rebuild overrides.
 # image_reference_fasta enables optional PDF/SVG export through GFA_Editor; export
 # failures are recorded in the rebuild run report and do not fail core GFA/FASTA output.
-# merged_gfa_template = "${{results_dir}}/resolve_gfa/mito/graph/merged_unresolved.gfa"
+# merged_gfa_template = "${{results_dir}}/03.resolve_gfa/mito/graph/merged_unresolved.gfa"
 # keep_debug = true
 
 # Use enabled = false to keep a case in this config while excluding it from the
@@ -352,26 +412,32 @@ name = "mito_subgraph_001"
 organelle = "mito"
 subgraph = "subgraph_001"
 
-# Checkpoint 1 consumes the draft graph and auto-writes checked_draft_gfa only
-# when topology is simple and all GFA links reference declared segment records.
-draft_graph = "${{results_dir}}/draft_asm/${{organelle}}/03.finalize_graph/graph.gfa"
+# Numbered output handoff paths.
+# 01.recruit writes reads -> 02.draft_asm builds draft graph -> workflow
+# records checkpoint files -> 03.resolve_gfa writes resolved FASTA ->
+# 04.polish writes validation evidence -> 05.rebuild writes final products.
+workflow_dir = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}"
+
+# Checkpoint 1 consumes the draft graph and writes checked_draft_gfa only when
+# topology is simple and all GFA links reference declared segment records.
+draft_graph = "${{results_dir}}/02.draft_asm/${{organelle}}/03.finalize_graph/graph.gfa"
 checked_draft_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
 
 # Resolve uses the matching FASTA from commands.recruit.baits when reference is omitted.
 # reference = "/path/to/mito.fasta"
-resolve_out_dir = "${{results_dir}}/resolve_gfa"
+resolve_out_dir = "${{results_dir}}/03.resolve_gfa"
 
-# Polish inputs. When omitted, workflow derives reads from recruit output and
-# linearized/reference FASTA from resolve_out_dir/ORGANELLE/fasta/.
-reads = "${{results_dir}}/recruit/${{organelle}}.fastq.gz"
-# linearized_fasta = "${{results_dir}}/resolve_gfa/${{organelle}}/fasta/resolved_subgraphs.fasta"
-# polish_reference = "${{results_dir}}/resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
-polish_out_dir = "${{results_dir}}/polish"
+# Explicit polish handoff inputs from 01.recruit and 03.resolve_gfa.
+reads = "${{results_dir}}/01.recruit/${{organelle}}.fastq.gz"
+linearized_fasta = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/resolved_subgraphs.fasta"
+polish_reference = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
+polish_out_dir = "${{results_dir}}/04.polish"
 
-rebuild_out_dir = "${{results_dir}}/rebuild/${{organelle}}"
-# rebuild_edited_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
+rebuild_out_dir = "${{results_dir}}/05.rebuild/${{organelle}}"
+rebuild_edited_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
+# checkpoint2 selects the final polished FASTA automatically; set this only for manual override.
 # rebuild_polished_fasta = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_2/round_1/polish_aln_v2.fasta"
-# image_reference_fasta = "${{results_dir}}/resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
+image_reference_fasta = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
 
 [workflow.case.plastid_subgraph_001]
 enabled = true
@@ -379,12 +445,17 @@ name = "plastid_subgraph_001"
 organelle = "plastid"
 subgraph = "subgraph_001"
 
-draft_graph = "${{results_dir}}/draft_asm/${{organelle}}/03.finalize_graph/graph.gfa"
+workflow_dir = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}"
+draft_graph = "${{results_dir}}/02.draft_asm/${{organelle}}/03.finalize_graph/graph.gfa"
 checked_draft_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
-resolve_out_dir = "${{results_dir}}/resolve_gfa"
-reads = "${{results_dir}}/recruit/${{organelle}}.fastq.gz"
-polish_out_dir = "${{results_dir}}/polish"
-rebuild_out_dir = "${{results_dir}}/rebuild/${{organelle}}"
+resolve_out_dir = "${{results_dir}}/03.resolve_gfa"
+reads = "${{results_dir}}/01.recruit/${{organelle}}.fastq.gz"
+linearized_fasta = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/resolved_subgraphs.fasta"
+polish_reference = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
+polish_out_dir = "${{results_dir}}/04.polish"
+rebuild_out_dir = "${{results_dir}}/05.rebuild/${{organelle}}"
+rebuild_edited_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
+image_reference_fasta = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
 "#
     )
 }
@@ -589,6 +660,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
         results_dir: out_dir.clone(),
         soft_paths: PathBuf::from("soft_paths.txt"),
         mode: "stepwise".to_string(),
+        command_mode: WorkflowCommandMode::Classic,
         max_rounds: 3,
         threads: 1,
         force: true,
@@ -597,6 +669,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
             enabled: false,
             reads: None,
             out_dir: out_dir.join("recruit"),
+            threads: None,
             baits: Vec::new(),
             prefix: None,
             bait_format: None,
@@ -626,6 +699,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
         asm: WorkflowAsmConfig {
             enabled: false,
             out_dir: out_dir.join("draft_asm"),
+            threads: None,
             profile: None,
             stable: false,
             min_graph_coverage: None,
@@ -637,6 +711,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
             keep_debug_files: false,
             extra_args: Vec::new(),
         },
+        polish: WorkflowPolishConfig { threads: None },
         rebuild: WorkflowRebuildConfig {
             enabled: false,
             out_dir: out_dir.join("rebuild"),
@@ -959,6 +1034,12 @@ fn write_plan_script(
     manual_message: Option<&str>,
     comment_checkpoint1: bool,
 ) -> Result<(), OrgraftError> {
+    if config.command_mode == WorkflowCommandMode::Concise {
+        return write_concise_plan_script(path, config, case, manual_message);
+    }
+    let command_mode = config.command_mode;
+    let detailed = command_mode == WorkflowCommandMode::Detailed;
+
     let mut script = String::new();
     writeln!(script, "#!/usr/bin/env bash").unwrap();
     writeln!(script, "set -euo pipefail").unwrap();
@@ -971,6 +1052,7 @@ fn write_plan_script(
     .unwrap();
     writeln!(script, "# sample: {}", case.sample).unwrap();
     writeln!(script, "# mode: {}", config.mode).unwrap();
+    writeln!(script, "# command_mode: {}", config.command_mode.as_str()).unwrap();
     writeln!(script, "# project_sample: {}", config.sample).unwrap();
     writeln!(script, "# results_dir: {}", config.results_dir.display()).unwrap();
     if let Some(message) = manual_message {
@@ -1026,8 +1108,20 @@ fn write_plan_script(
     )
     .unwrap();
 
+    write_stage_header(
+        &mut script,
+        "  ",
+        "01.recruit",
+        "select organelle reads from raw HiFi reads and bait references",
+        &[
+            "handoff: raw_reads + baits -> 01.recruit/{organelle}.fastq.gz",
+            "optional examples: --platform HiFi --bait-format auto --max-reads all,20000",
+            "optional examples: --split-output label --gzip-output on --write-sampled-ids",
+        ],
+        detailed,
+    );
     if config.recruit.enabled {
-        writeln!(script, "  {}", recruit_command(config)?).unwrap();
+        writeln!(script, "  {}", recruit_command(config, command_mode)?).unwrap();
     } else {
         writeln!(
             script,
@@ -1037,9 +1131,21 @@ fn write_plan_script(
         .unwrap();
     }
 
+    write_stage_header(
+        &mut script,
+        "  ",
+        "02.draft_asm",
+        "assemble selected reads into the conservative draft graph",
+        &[
+            "handoff: 01.recruit/{organelle}.fastq.gz -> 02.draft_asm/{organelle}/03.finalize_graph/graph.gfa",
+            "optional examples: --profile standard --stable --subsets 3,5,10",
+            "optional examples: --min-graph-coverage 18 --branch-ratio 0.30 --tip-len 3000",
+        ],
+        detailed,
+    );
     if config.asm.enabled {
         write_checkpoint_draft_backup(&mut script, case);
-        writeln!(script, "  {}", asm_command(config, case)).unwrap();
+        writeln!(script, "  {}", asm_command(config, case, command_mode)).unwrap();
         write_checkpoint_draft_restore(&mut script, case);
     } else {
         writeln!(
@@ -1056,6 +1162,17 @@ fn write_plan_script(
         shell_quote(&config.config_path),
         shell_quote_str(&case.name),
         if config.force { " --force" } else { "" }
+    );
+    write_stage_header(
+        &mut script,
+        "  ",
+        "checkpoint1",
+        "check graph topology and materialize checked_draft.gfa when simple",
+        &[
+            "manual stop: complex topology or missing GFA segment/link consistency",
+            "handoff: 02.draft_asm graph -> workflow/.../checkpoint_1/checked_draft.gfa",
+        ],
+        detailed,
     );
     if comment_checkpoint1 {
         writeln!(script, "  # already-run: {checkpoint1}").unwrap();
@@ -1083,19 +1200,45 @@ fn write_plan_script(
     writeln!(script, "fi").unwrap();
     writeln!(script).unwrap();
 
+    write_stage_header(
+        &mut script,
+        "",
+        "03.resolve_gfa",
+        "linearize the checked graph and prepare rotated reference handoff files",
+        &[
+            "handoff: checked_draft.gfa -> 03.resolve_gfa/{organelle}/fasta/resolved_subgraphs.fasta",
+            "optional examples: --reference FILE or --pre-rotated-reference FILE --force",
+        ],
+        detailed,
+    );
     writeln!(script, "{}", resolve_command(config, case, config.force)).unwrap();
     writeln!(script).unwrap();
     writeln!(script, "final_polished=\"\"").unwrap();
+    writeln!(script).unwrap();
+    write_stage_header(
+        &mut script,
+        "",
+        "04.polish_checkpoint2",
+        "polish, validate SV/SNV-InDel evidence, and advance correction rounds",
+        &[
+            "handoff: 03.resolve_gfa FASTA + 01.recruit reads -> 04.polish validation reports",
+            "checkpoint2 accepts SV pass, writes corrected polish_aln_v*.fasta for the next round, and stops at max_rounds",
+            "optional examples: --soft-paths soft_paths.txt --threads 8 --max-rounds 3 --force",
+        ],
+        detailed,
+    );
 
     for round in 1..=config.max_rounds {
         let draft = round_draft_path(case, round);
         writeln!(script, "if [[ -z \"$final_polished\" ]]; then").unwrap();
+        writeln!(script, "  # 04.polish round {round}").unwrap();
         writeln!(
             script,
             "  {}",
-            polish_command(config, case, round, &draft, config.force)
+            polish_command(config, case, round, &draft, config.force, command_mode)
         )
         .unwrap();
+        writeln!(script, "  # checkpoint2 round {round}").unwrap();
         writeln!(
             script,
             "  {} workflow checkpoint2 --config {} --case {} --round {}{}",
@@ -1186,23 +1329,101 @@ fn write_plan_script(
         "# Rebuild after checkpoint2 complete, using the final verified graph/FASTA:"
     )
     .unwrap();
+    write_stage_header(
+        &mut script,
+        "",
+        "05.rebuild",
+        "rebuild the final verified graph and compact reports",
+        &[
+            "handoff: checked draft graph + final polished FASTA -> 05.rebuild/{organelle}",
+            "optional examples: --image-reference-fasta FILE --merged-gfa-template FILE",
+            "optional examples: --threads 4 --keep-debug",
+        ],
+        detailed,
+    );
     if config.rebuild.enabled {
         writeln!(
             script,
             "{}",
-            rebuild_command_with_polished_arg(config, case, config.force, "\"${final_polished}\"")
+            rebuild_command_with_polished_arg(
+                config,
+                case,
+                config.force,
+                "\"${final_polished}\"",
+                command_mode,
+            )
         )
         .unwrap();
     } else {
         writeln!(
             script,
             "# {}",
-            rebuild_command_with_polished(config, case, config.force, "FINAL_POLISHED_FASTA")
+            rebuild_command_with_polished(
+                config,
+                case,
+                config.force,
+                "FINAL_POLISHED_FASTA",
+                command_mode,
+            )
         )
         .unwrap();
     }
 
     write_executable_text(path, &script)
+}
+
+fn write_concise_plan_script(
+    path: &Path,
+    config: &WorkflowConfig,
+    case: &WorkflowCase,
+    manual_message: Option<&str>,
+) -> Result<(), OrgraftError> {
+    let mut script = String::new();
+    writeln!(script, "#!/usr/bin/env bash").unwrap();
+    writeln!(script, "set -euo pipefail").unwrap();
+    writeln!(script).unwrap();
+    writeln!(
+        script,
+        "# Generated by orgraft workflow for case {} ({}/{})",
+        case.name, case.organelle, case.subgraph
+    )
+    .unwrap();
+    writeln!(script, "# sample: {}", case.sample).unwrap();
+    writeln!(script, "# mode: {}", config.mode).unwrap();
+    writeln!(script, "# command_mode: {}", config.command_mode.as_str()).unwrap();
+    writeln!(script, "# project_sample: {}", config.sample).unwrap();
+    writeln!(script, "# results_dir: {}", config.results_dir.display()).unwrap();
+    if let Some(message) = manual_message {
+        writeln!(script, "# manual_required: {message}").unwrap();
+    }
+    writeln!(script).unwrap();
+    write_script_runtime_header(&mut script);
+    writeln!(
+        script,
+        "{} workflow run --config {} --case {}{}",
+        orgraft_shell_token(),
+        shell_quote(&config.config_path),
+        shell_quote_str(&case.name),
+        if config.force { " --force" } else { "" }
+    )
+    .unwrap();
+    write_executable_text(path, &script)
+}
+
+fn write_stage_header(
+    script: &mut String,
+    indent: &str,
+    stage: &str,
+    summary: &str,
+    detailed_notes: &[&str],
+    detailed: bool,
+) {
+    writeln!(script, "{indent}# {stage}: {summary}").unwrap();
+    if detailed {
+        for note in detailed_notes {
+            writeln!(script, "{indent}#   {note}").unwrap();
+        }
+    }
 }
 
 fn checkpoint_draft_backup_path(case: &WorkflowCase) -> Option<PathBuf> {
@@ -1288,15 +1509,34 @@ fn write_all_cases_plan_script(path: &Path, config: &WorkflowConfig) -> Result<(
     .unwrap();
     writeln!(script, "# sample: {}", config.sample).unwrap();
     writeln!(script, "# mode: {}", config.mode).unwrap();
+    writeln!(script, "# command_mode: {}", config.command_mode.as_str()).unwrap();
     writeln!(script, "# results_dir: {}", config.results_dir.display()).unwrap();
     writeln!(script).unwrap();
     write_script_runtime_header(&mut script);
 
-    writeln!(
-        script,
-        "# Each case script is complete and starts at recruit/asm."
-    )
-    .unwrap();
+    match config.command_mode {
+        WorkflowCommandMode::Detailed => {
+            writeln!(
+                script,
+                "# Each case script expands all stages with common optional arguments."
+            )
+            .unwrap();
+        }
+        WorkflowCommandMode::Classic => {
+            writeln!(
+                script,
+                "# Each case script expands all stages with classic required arguments."
+            )
+            .unwrap();
+        }
+        WorkflowCommandMode::Concise => {
+            writeln!(
+                script,
+                "# Each case script is concise and delegates execution to orgraft workflow run."
+            )
+            .unwrap();
+        }
+    }
     writeln!(
         script,
         "# The master script only chooses the configured case order."
@@ -1340,7 +1580,14 @@ fn write_next_round_script(
         writeln!(
             script,
             "{}",
-            polish_command(config, case, round, draft, config.force)
+            polish_command(
+                config,
+                case,
+                round,
+                draft,
+                config.force,
+                config.command_mode
+            )
         )
         .unwrap();
         writeln!(
@@ -1378,6 +1625,18 @@ fn orgraft_shell_token() -> &'static str {
     "\"${ORGRAFT_BIN}\""
 }
 
+fn recruit_threads(config: &WorkflowConfig) -> usize {
+    config.recruit.threads.unwrap_or(config.threads)
+}
+
+fn asm_threads(config: &WorkflowConfig) -> usize {
+    config.asm.threads.unwrap_or(config.threads)
+}
+
+fn polish_threads(config: &WorkflowConfig) -> usize {
+    config.polish.threads.unwrap_or(config.threads)
+}
+
 fn recruit_args(config: &WorkflowConfig) -> Result<Vec<String>, OrgraftError> {
     let recruit = &config.recruit;
     let reads = recruit.reads.as_ref().ok_or_else(|| {
@@ -1397,7 +1656,7 @@ fn recruit_args(config: &WorkflowConfig) -> Result<Vec<String>, OrgraftError> {
         "--out-dir".to_string(),
         recruit.out_dir.display().to_string(),
         "--threads".to_string(),
-        config.threads.to_string(),
+        recruit_threads(config).to_string(),
     ];
     for (label, path) in &recruit.baits {
         match label.as_str() {
@@ -1480,7 +1739,7 @@ fn asm_args(config: &WorkflowConfig, case: &WorkflowCase) -> Vec<String> {
         "--out-dir".to_string(),
         asm.out_dir.display().to_string(),
         "--threads".to_string(),
-        config.threads.to_string(),
+        asm_threads(config).to_string(),
     ];
     push_raw_string_option(&mut args, "--profile", asm.profile.as_deref());
     push_raw_flag(&mut args, "--stable", asm.stable);
@@ -1554,7 +1813,10 @@ fn rebuild_args_with_polished(
     Ok(args)
 }
 
-fn recruit_command(config: &WorkflowConfig) -> Result<String, OrgraftError> {
+fn recruit_command(
+    config: &WorkflowConfig,
+    _mode: WorkflowCommandMode,
+) -> Result<String, OrgraftError> {
     let recruit = &config.recruit;
     let reads = recruit.reads.as_ref().ok_or_else(|| {
         OrgraftError::InvalidArgument(
@@ -1575,7 +1837,7 @@ fn recruit_command(config: &WorkflowConfig) -> Result<String, OrgraftError> {
         "--out-dir".to_string(),
         shell_quote(&recruit.out_dir),
         "--threads".to_string(),
-        config.threads.to_string(),
+        recruit_threads(config).to_string(),
     ];
     for (label, path) in &recruit.baits {
         match label.as_str() {
@@ -1636,7 +1898,7 @@ fn recruit_command(config: &WorkflowConfig) -> Result<String, OrgraftError> {
     Ok(args.join(" "))
 }
 
-fn asm_command(config: &WorkflowConfig, case: &WorkflowCase) -> String {
+fn asm_command(config: &WorkflowConfig, case: &WorkflowCase, _mode: WorkflowCommandMode) -> String {
     let reads = case.asm_reads.as_ref().cloned().unwrap_or_else(|| {
         if config.recruit.enabled {
             config
@@ -1660,7 +1922,7 @@ fn asm_command(config: &WorkflowConfig, case: &WorkflowCase) -> String {
         "--out-dir".to_string(),
         shell_quote(&asm.out_dir),
         "--threads".to_string(),
-        config.threads.to_string(),
+        asm_threads(config).to_string(),
     ];
     push_string_option(&mut args, "--profile", asm.profile.as_deref());
     push_flag(&mut args, "--stable", asm.stable);
@@ -1681,8 +1943,9 @@ fn rebuild_command_with_polished(
     case: &WorkflowCase,
     force: bool,
     polished_fasta: &str,
+    mode: WorkflowCommandMode,
 ) -> String {
-    rebuild_command_with_polished_arg(config, case, force, &shell_quote_str(polished_fasta))
+    rebuild_command_with_polished_arg(config, case, force, &shell_quote_str(polished_fasta), mode)
 }
 
 fn rebuild_command_with_polished_arg(
@@ -1690,6 +1953,7 @@ fn rebuild_command_with_polished_arg(
     case: &WorkflowCase,
     force: bool,
     polished_fasta_arg: &str,
+    _mode: WorkflowCommandMode,
 ) -> String {
     let rebuild = &config.rebuild;
     let edited_gfa = case
@@ -1799,7 +2063,7 @@ fn run_polish_round(
         "--out-dir".to_string(),
         polish_run_out_dir(case, round).display().to_string(),
         "--threads".to_string(),
-        config.threads.to_string(),
+        polish_threads(config).to_string(),
         "--max-rounds".to_string(),
         config.max_rounds.to_string(),
     ];
@@ -1856,8 +2120,14 @@ impl WorkflowConfig {
             .and_then(|section| section.get("mode"))
             .cloned()
             .unwrap_or_else(|| "stepwise".to_string());
+        let command_mode = WorkflowCommandMode::parse(
+            workflow
+                .and_then(|section| section.get("command_mode"))
+                .map(String::as_str)
+                .unwrap_or("classic"),
+        )?;
         let max_rounds = parse_config_usize(workflow, "max_rounds", 3)?.max(1);
-        let threads = parse_config_usize(workflow, "threads", 8)?.max(1);
+        let threads = parse_config_usize(workflow, "threads", 64)?.max(1);
         let force = parse_config_bool(workflow, "force", false)?;
         let auto_snv_indel_correction =
             parse_config_bool(workflow, "auto_snv_indel_correction", true)?;
@@ -1877,6 +2147,7 @@ impl WorkflowConfig {
             &results_dir_string,
             &source_results_dir_string,
         )?;
+        let polish = WorkflowPolishConfig::from_section(raw.section("commands.polish"))?;
         let rebuild = WorkflowRebuildConfig::from_section(
             raw.section("commands.rebuild"),
             &sample,
@@ -1920,12 +2191,14 @@ impl WorkflowConfig {
             results_dir,
             soft_paths,
             mode,
+            command_mode,
             max_rounds,
             threads,
             force,
             auto_snv_indel_correction,
             recruit,
             asm,
+            polish,
             rebuild,
             topology_simple_allowed_classes,
             cases,
@@ -1983,7 +2256,7 @@ impl WorkflowCase {
         );
         let draft_graph = path_or(
             "draft_graph",
-            "${results_dir}/draft_asm/${organelle}/03.finalize_graph/graph.gfa".to_string(),
+            "${results_dir}/02.draft_asm/${organelle}/03.finalize_graph/graph.gfa".to_string(),
         );
         let checked_draft_gfa = path_or(
             "checked_draft_gfa",
@@ -1992,12 +2265,15 @@ impl WorkflowCase {
         );
         let reads = path_or(
             "reads",
-            "${results_dir}/recruit/${organelle}.fastq.gz".to_string(),
+            "${results_dir}/01.recruit/${organelle}.fastq.gz".to_string(),
         );
         let asm_reads = optional_path("asm_reads");
-        let resolve_out_dir = path_or("resolve_out_dir", "${results_dir}/resolve_gfa".to_string());
-        let polish_out_dir = path_or("polish_out_dir", "${results_dir}/polish".to_string());
-        let rebuild_out_dir = path_or("rebuild_out_dir", "${results_dir}/rebuild".to_string());
+        let resolve_out_dir = path_or(
+            "resolve_out_dir",
+            "${results_dir}/03.resolve_gfa".to_string(),
+        );
+        let polish_out_dir = path_or("polish_out_dir", "${results_dir}/04.polish".to_string());
+        let rebuild_out_dir = path_or("rebuild_out_dir", "${results_dir}/05.rebuild".to_string());
         let rebuild_edited_gfa = optional_path("rebuild_edited_gfa");
         let rebuild_polished_fasta = optional_path("rebuild_polished_fasta");
         let image_reference_fasta = optional_path("image_reference_fasta");
@@ -2046,7 +2322,8 @@ impl WorkflowRecruitConfig {
             enabled: parse_section_bool(&section, "enabled", false)?,
             reads: optional_expanded_path(&section, "raw_reads", &expand)
                 .or_else(|| optional_expanded_path(&section, "reads", &expand)),
-            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/recruit", &expand),
+            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/01.recruit", &expand),
+            threads: parse_optional_usize(&section, "threads")?,
             baits: parse_baits(section.get("baits"), &expand),
             prefix: section.get("prefix").cloned(),
             bait_format: section.get("bait_format").cloned(),
@@ -2096,7 +2373,8 @@ impl WorkflowAsmConfig {
         };
         Ok(Self {
             enabled: parse_section_bool(&section, "enabled", false)?,
-            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/draft_asm", &expand),
+            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/02.draft_asm", &expand),
+            threads: parse_optional_usize(&section, "threads")?,
             profile: section.get("profile").cloned(),
             stable: parse_section_bool(&section, "stable", false)?,
             min_graph_coverage: parse_optional_u32(&section, "min_graph_coverage")?,
@@ -2107,6 +2385,15 @@ impl WorkflowAsmConfig {
             subsets: section.get("subsets").cloned(),
             keep_debug_files: parse_section_bool(&section, "keep_debug_files", false)?,
             extra_args: split_extra_args(section.get("extra_args")),
+        })
+    }
+}
+
+impl WorkflowPolishConfig {
+    fn from_section(section: Option<&BTreeMap<String, String>>) -> Result<Self, OrgraftError> {
+        let section = section.cloned().unwrap_or_default();
+        Ok(Self {
+            threads: parse_optional_usize(&section, "threads")?,
         })
     }
 }
@@ -2124,7 +2411,7 @@ impl WorkflowRebuildConfig {
         };
         Ok(Self {
             enabled: parse_section_bool(&section, "enabled", false)?,
-            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/rebuild", &expand),
+            out_dir: expanded_path_or(&section, "out_dir", "${results_dir}/05.rebuild", &expand),
             threads: parse_optional_usize(&section, "threads")?,
             edited_gfa: optional_expanded_path(&section, "edited_gfa", &expand),
             polished_fasta: optional_expanded_path(&section, "polished_fasta", &expand),
@@ -3576,6 +3863,7 @@ fn polish_command(
     round: usize,
     draft: &Path,
     force: bool,
+    _mode: WorkflowCommandMode,
 ) -> String {
     let mut command = format!(
         "{} polish --organelle {} --subgraph {} --draft {} --reference {} --reads {} --soft-paths {} --out-dir {} --threads {} --max-rounds {}",
@@ -3587,7 +3875,7 @@ fn polish_command(
         shell_quote(&case.reads),
         shell_quote(&config.soft_paths),
         shell_quote(&polish_run_out_dir(case, round)),
-        config.threads,
+        polish_threads(config),
         config.max_rounds,
     );
     if force {
@@ -3775,6 +4063,7 @@ mod tests {
             sample: "sample_001".to_string(),
             results_dir: "results_workflow".to_string(),
             soft_paths: "soft_paths.txt".to_string(),
+            command_mode: WorkflowCommandMode::Classic,
         });
         assert!(template.contains("results_workflow"));
         assert!(!template.contains("source_results_dir"));
@@ -3791,11 +4080,45 @@ mod tests {
         assert!(template.contains("organelle = \"mito\""));
         assert!(template.contains("organelle = \"plastid\""));
         assert!(template.contains("max_rounds = 3"));
+        assert!(template.contains("command_mode = \"classic\""));
         assert!(template.contains("auto_snv_indel_correction = true"));
         assert!(template.contains(
-            "draft_graph = \"${results_dir}/draft_asm/${organelle}/03.finalize_graph/graph.gfa\""
+            "draft_graph = \"${results_dir}/02.draft_asm/${organelle}/03.finalize_graph/graph.gfa\""
         ));
+        assert!(template
+            .contains("workflow_dir = \"${results_dir}/workflow/${organelle}/${subgraph}\""));
+        assert!(template.contains("resolve_out_dir = \"${results_dir}/03.resolve_gfa\""));
+        assert!(template.contains("polish_out_dir = \"${results_dir}/04.polish\""));
+        assert!(template.contains("rebuild_out_dir = \"${results_dir}/05.rebuild/${organelle}\""));
         assert!(template.contains("checkpoint_1/checked_draft.gfa"));
+    }
+
+    #[test]
+    fn template_options_select_command_mode() {
+        let classic_args = vec![
+            "--command-mode".to_string(),
+            "classic".to_string(),
+            "--sample".to_string(),
+            "S1".to_string(),
+        ];
+        let classic_options = TemplateOptions::from_args(&classic_args).unwrap();
+        let classic = workflow_config_template(&classic_options);
+        assert!(classic.contains("sample = \"S1\""));
+        assert!(classic.contains("command_mode = \"classic\""));
+
+        let concise_args = vec!["--command-mode".to_string(), "concise".to_string()];
+        let concise_options = TemplateOptions::from_args(&concise_args).unwrap();
+        let concise = workflow_config_template(&concise_options);
+        assert!(concise.contains("command_mode = \"concise\""));
+
+        let default_options = TemplateOptions::from_args(&[]).unwrap();
+        let default_template = workflow_config_template(&default_options);
+        assert!(default_template.contains("command_mode = \"classic\""));
+
+        assert!(HELP.contains("--command-mode MODE"));
+        assert!(HELP.contains("[classic]"));
+        assert!(HELP.contains("classic|detailed|concise"));
+        assert!(HELP.contains("classic expands stages; detailed adds handoff/options"));
     }
 
     #[test]
@@ -3872,14 +4195,14 @@ reference = "mito.fa"
         assert_eq!(
             polish_round_dir(case, 1),
             dir.join("results_workflow")
-                .join("polish")
+                .join("04.polish")
                 .join("mito")
                 .join("subgraph_001")
         );
         assert_eq!(
             polish_round_dir(case, 2),
             dir.join("results_workflow")
-                .join("polish")
+                .join("04.polish")
                 .join("round_2")
                 .join("mito")
                 .join("subgraph_001")
@@ -3901,9 +4224,66 @@ reference = "mito.fa"
         assert!(script.contains("manual_required)"));
         assert!(script.contains("final_polished="));
         assert!(script.contains("\"${ORGRAFT_BIN}\" polish"));
-        assert!(!script.contains("/polish/round_1/"));
-        assert!(script.contains("/polish/round_2/"));
+        assert!(!script.contains("/04.polish/round_1/"));
+        assert!(script.contains("/04.polish/round_2/"));
         assert!(script.contains("workflow complete at checkpoint2 round 1"));
+    }
+
+    #[test]
+    fn command_mode_classic_expands_stages_and_concise_delegates_run() {
+        let dir = test_dir("workflow_command_modes");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("orgraft.workflow.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[project]
+sample = "S1"
+results_dir = "{}/results_workflow"
+
+[commands.recruit]
+enabled = true
+raw_reads = "reads.fastq"
+baits = "mito=mito.fa"
+
+[commands.asm]
+enabled = true
+
+[workflow.case]
+name = "mito_subgraph_001"
+organelle = "mito"
+subgraph = "subgraph_001"
+reference = "mito.fa"
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut config = WorkflowConfig::from_path(&config_path).unwrap();
+        let case = config.cases[0].clone();
+
+        config.command_mode = WorkflowCommandMode::Classic;
+        let classic_path = dir.join("classic.commands.sh");
+        write_plan_script(&classic_path, &config, &case, None, false).unwrap();
+        let classic = fs::read_to_string(&classic_path).unwrap();
+        assert!(classic.contains("# 01.recruit:"));
+        assert!(classic.contains("# 02.draft_asm:"));
+        assert!(classic.contains("# 03.resolve_gfa:"));
+        assert!(classic.contains("# 04.polish_checkpoint2:"));
+        assert!(classic.contains("# 05.rebuild:"));
+        assert!(classic.contains("\"${ORGRAFT_BIN}\" recruit"));
+        assert!(classic.contains("\"${ORGRAFT_BIN}\" asm"));
+        assert!(classic.contains("\"${ORGRAFT_BIN}\" polish"));
+        assert!(!classic.contains("common args: --platform"));
+
+        config.command_mode = WorkflowCommandMode::Concise;
+        let concise_path = dir.join("concise.commands.sh");
+        write_plan_script(&concise_path, &config, &case, None, false).unwrap();
+        let concise = fs::read_to_string(&concise_path).unwrap();
+        assert!(concise.contains("\"${ORGRAFT_BIN}\" workflow run"));
+        assert_eq!(concise.matches("\"${ORGRAFT_BIN}\" recruit").count(), 0);
+        assert_eq!(concise.matches("\"${ORGRAFT_BIN}\" polish").count(), 0);
     }
 
     #[test]
@@ -3938,11 +4318,11 @@ subgraph = "subgraph_001"
         );
         assert_eq!(
             config.cases[0].draft_graph,
-            PathBuf::from("results_workflow/draft_asm/plastid/03.finalize_graph/graph.gfa")
+            PathBuf::from("results_workflow/02.draft_asm/plastid/03.finalize_graph/graph.gfa")
         );
         assert_eq!(
             config.cases[0].reads,
-            PathBuf::from("results_workflow/recruit/plastid.fastq.gz")
+            PathBuf::from("results_workflow/01.recruit/plastid.fastq.gz")
         );
     }
 
@@ -3989,7 +4369,9 @@ reference = "plastid.fa"
 
         let script = fs::read_to_string(&master).unwrap();
         assert!(script.contains("Generated by orgraft workflow for all configured cases"));
-        assert!(script.contains("Each case script is complete and starts at recruit/asm"));
+        assert!(
+            script.contains("Each case script expands all stages with classic required arguments")
+        );
         assert_eq!(script.matches("\"${ORGRAFT_BIN}\" recruit").count(), 0);
         assert_eq!(script.matches("\"${ORGRAFT_BIN}\" asm").count(), 0);
         assert!(script.contains("bash "));

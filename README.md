@@ -45,7 +45,7 @@ cargo build
 
 ./orgraft --help
 ./orgraft setup --soft-paths soft_paths.txt --requirements requirements.txt
-./orgraft workflow init --out results_workflow/orgraft.workflow.toml
+./orgraft workflow init --command-mode classic --out results_workflow/orgraft.workflow.toml
 ./orgraft workflow plan --config results_workflow/orgraft.workflow.toml
 bash results_workflow/workflow.commands.sh
 ```
@@ -69,6 +69,10 @@ recruit -> asm -> checkpoint1 -> resolve -> polish/checkpoint2 -> rebuild
 The workflow layer stays thin: core algorithms remain in the individual
 commands, while workflow owns project layout, command generation, manual
 checkpoint status, and bounded SNV/InDel correction rounds.
+
+Generated workflow scripts support three display modes: `classic` is the
+default expanded script with the core argument set, `detailed` adds file
+handoff notes, and `concise` delegates each case to `orgraft workflow run`.
 
 ## Runtime Dependencies
 

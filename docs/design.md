@@ -48,6 +48,9 @@ GFA_Editor
 
 Paths are stage-oriented and should change deliberately, because downstream
 inspection, reporting, and optional GFA_Editor export depend on them.
+Workflow-generated roots are numbered for the major products:
+`01.recruit`, `02.draft_asm`, `03.resolve_gfa`, `04.polish`, and
+`05.rebuild`; checkpoint scripts and status files live under `workflow/`.
 
 | Stage | Core outputs | Notes |
 | --- | --- | --- |

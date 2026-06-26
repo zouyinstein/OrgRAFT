@@ -7,6 +7,8 @@ use std::process::{Child, Command, Stdio};
 use crate::commands::shared::{print_contract, CommandContract};
 use crate::error::OrgraftError;
 
+const DEFAULT_MAX_READS: usize = 20_000;
+
 const HELP: &str = r#"orgraft recruit
 
 Reference/seed-based read recruitment prototype.
@@ -27,7 +29,7 @@ Additional Parameters:
   --threads N               minimap2 and pigz threads [1]
   --platform NAME           HiFi, CLR, ONT, ultra-long [HiFi]
   --bait-format FORMAT      auto, fasta, gfa [auto]
-  --max-reads NAME,N        cap selected reads for a bait label or partition
+  --max-reads SCOPE,N|all   cap selected reads, e.g. mito,20000; plastid,all [all,20000]
   --advanced-help           show bait, sampling, debug, and compression options
 
 Layout: OUT/{*.fastq[.gz],logs}
@@ -230,7 +232,8 @@ struct RecruitOptions {
     min_mapq: u8,
     min_aln_len: u64,
     sam: Option<PathBuf>,
-    max_reads: BTreeMap<String, usize>,
+    default_max_reads: Option<usize>,
+    max_reads: BTreeMap<String, Option<usize>>,
     random_seed: u64,
     write_sampled_ids: bool,
     read_stats_mode: ReadStatsMode,
@@ -261,6 +264,7 @@ impl RecruitOptions {
             min_mapq: 0,
             min_aln_len: 0,
             sam: None,
+            default_max_reads: Some(DEFAULT_MAX_READS),
             max_reads: BTreeMap::new(),
             random_seed: 42,
             write_sampled_ids: false,
@@ -363,9 +367,12 @@ impl RecruitOptions {
                     options.sam = Some(PathBuf::from(value_after(args, &mut index, "--sam")?));
                 }
                 "--max-reads" => {
-                    let (name, max) =
-                        parse_max_reads(value_after(args, &mut index, "--max-reads")?)?;
-                    options.max_reads.insert(name, max);
+                    match parse_max_reads(value_after(args, &mut index, "--max-reads")?)? {
+                        MaxReadsArg::Default(limit) => options.default_max_reads = limit,
+                        MaxReadsArg::Scope(name, limit) => {
+                            options.max_reads.insert(name, limit);
+                        }
+                    }
                 }
                 "--random-seed" => {
                     options.random_seed =
@@ -555,24 +562,41 @@ fn platform_to_minimap2_preset(value: &str) -> Result<&'static str, OrgraftError
     }
 }
 
-fn parse_max_reads(value: &str) -> Result<(String, usize), OrgraftError> {
-    let (name, count) = value
-        .split_once(',')
-        .ok_or_else(|| OrgraftError::InvalidArgument("--max-reads expects NAME,N".to_string()))?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaxReadsArg {
+    Default(Option<usize>),
+    Scope(String, Option<usize>),
+}
+
+fn parse_max_reads(value: &str) -> Result<MaxReadsArg, OrgraftError> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(MaxReadsArg::Default(None));
+    }
+
+    let (name, count) = value.split_once(',').ok_or_else(|| {
+        OrgraftError::InvalidArgument("--max-reads expects all or SCOPE,N|all".to_string())
+    })?;
     let name = sanitize_name(name);
     if name.is_empty() {
         return Err(OrgraftError::InvalidArgument(
             "--max-reads NAME must not be empty".to_string(),
         ));
     }
+    let limit = parse_max_reads_limit(count)?;
     if name == "all" {
-        return Err(OrgraftError::InvalidArgument(
-            "--max-reads all,N is not supported; use a bait label such as mito,N or plastid,N"
-                .to_string(),
-        ));
+        return Ok(MaxReadsArg::Default(limit));
     }
-    let count = parse_number(count)?;
-    Ok((name, count))
+    Ok(MaxReadsArg::Scope(name, limit))
+}
+
+fn parse_max_reads_limit(value: &str) -> Result<Option<usize>, OrgraftError> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("all") {
+        Ok(None)
+    } else {
+        parse_number(value).map(Some)
+    }
 }
 
 fn parse_number<T>(value: &str) -> Result<T, OrgraftError>
@@ -1797,19 +1821,51 @@ fn select_reads(
                 .insert(read_id.clone());
         }
     }
+    let original_by_label = by_label.clone();
+    let original_by_partition = by_partition.clone();
 
     let mut sampled_scopes = BTreeSet::new();
     let mut has_partition_limit = false;
     let mut has_label_limit = false;
 
-    for (name, max_reads) in &options.max_reads {
+    match options.split_output {
+        SplitOutput::Label => {
+            apply_read_limit_map(
+                &mut by_label,
+                options.default_max_reads,
+                options.random_seed,
+                &mut sampled_scopes,
+            );
+            has_label_limit = options.default_max_reads.is_some();
+        }
+        SplitOutput::Partition => {
+            apply_read_limit_map(
+                &mut by_partition,
+                options.default_max_reads,
+                options.random_seed,
+                &mut sampled_scopes,
+            );
+            has_partition_limit = options.default_max_reads.is_some();
+        }
+        SplitOutput::None => {}
+    }
+
+    for (name, limit) in &options.max_reads {
         if let Some(values) = by_partition.get_mut(name) {
-            *values = sample_read_ids(values, *max_reads, options.random_seed, name);
-            sampled_scopes.insert(name.clone());
+            let original = original_by_partition
+                .get(name)
+                .expect("checked partition exists");
+            *values = apply_read_limit(original, *limit, options.random_seed, name);
+            if limit.is_some() {
+                sampled_scopes.insert(name.clone());
+            }
             has_partition_limit = true;
         } else if let Some(values) = by_label.get_mut(name) {
-            *values = sample_read_ids(values, *max_reads, options.random_seed, name);
-            sampled_scopes.insert(name.clone());
+            let original = original_by_label.get(name).expect("checked label exists");
+            *values = apply_read_limit(original, *limit, options.random_seed, name);
+            if limit.is_some() {
+                sampled_scopes.insert(name.clone());
+            }
             has_label_limit = true;
         } else {
             return Err(OrgraftError::InvalidArgument(format!(
@@ -1829,6 +1885,13 @@ fn select_reads(
         }
     } else {
         selected_all.extend(reads.keys().cloned());
+        if matches!(options.split_output, SplitOutput::None) {
+            if let Some(max_reads) = options.default_max_reads {
+                selected_all =
+                    sample_read_ids(&selected_all, max_reads, options.random_seed, "all");
+                sampled_scopes.insert("all".to_string());
+            }
+        }
     }
 
     for values in by_label.values_mut() {
@@ -1844,6 +1907,32 @@ fn select_reads(
         selected_by_partition: by_partition,
         sampled_scopes,
     })
+}
+
+fn apply_read_limit_map(
+    values_by_scope: &mut BTreeMap<String, BTreeSet<String>>,
+    limit: Option<usize>,
+    seed: u64,
+    sampled_scopes: &mut BTreeSet<String>,
+) {
+    for (scope, values) in values_by_scope {
+        *values = apply_read_limit(values, limit, seed, scope);
+        if limit.is_some() {
+            sampled_scopes.insert(scope.clone());
+        }
+    }
+}
+
+fn apply_read_limit(
+    ids: &BTreeSet<String>,
+    limit: Option<usize>,
+    seed: u64,
+    scope: &str,
+) -> BTreeSet<String> {
+    match limit {
+        Some(max_reads) => sample_read_ids(ids, max_reads, seed, scope),
+        None => ids.clone(),
+    }
 }
 
 fn sample_read_ids(
@@ -2868,11 +2957,63 @@ mod tests {
     }
 
     #[test]
-    fn max_reads_all_is_not_supported() {
-        let error = parse_max_reads("all,20000").unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("--max-reads all,N is not supported"));
+    fn max_reads_parses_default_and_scope_limits() {
+        assert_eq!(parse_max_reads("all").unwrap(), MaxReadsArg::Default(None));
+        assert_eq!(
+            parse_max_reads("all,50000").unwrap(),
+            MaxReadsArg::Default(Some(50_000))
+        );
+        assert_eq!(
+            parse_max_reads("mito,all").unwrap(),
+            MaxReadsArg::Scope("mito".to_string(), None)
+        );
+        assert_eq!(
+            parse_max_reads("mito,12000").unwrap(),
+            MaxReadsArg::Scope("mito".to_string(), Some(12_000))
+        );
+    }
+
+    #[test]
+    fn default_max_reads_caps_each_label() {
+        let options = RecruitOptions::from_args(&[
+            "--reads".to_string(),
+            "reads.fastq".to_string(),
+            "--bait".to_string(),
+            "mito=seed.fa".to_string(),
+        ])
+        .unwrap();
+        let reads = fake_alignment_reads("mito", DEFAULT_MAX_READS + 5);
+        let bait = fake_bait_preparation("mito");
+
+        let selection = select_reads(&reads, &bait, &options).unwrap();
+
+        assert_eq!(selection.selected_by_label["mito"].len(), DEFAULT_MAX_READS);
+        assert_eq!(selection.selected_all.len(), DEFAULT_MAX_READS);
+        assert!(selection.sampled_scopes.contains("mito"));
+    }
+
+    #[test]
+    fn max_reads_all_disables_default_cap() {
+        let options = RecruitOptions::from_args(&[
+            "--reads".to_string(),
+            "reads.fastq".to_string(),
+            "--bait".to_string(),
+            "mito=seed.fa".to_string(),
+            "--max-reads".to_string(),
+            "all".to_string(),
+        ])
+        .unwrap();
+        let reads = fake_alignment_reads("mito", DEFAULT_MAX_READS + 5);
+        let bait = fake_bait_preparation("mito");
+
+        let selection = select_reads(&reads, &bait, &options).unwrap();
+
+        assert_eq!(
+            selection.selected_by_label["mito"].len(),
+            DEFAULT_MAX_READS + 5
+        );
+        assert_eq!(selection.selected_all.len(), DEFAULT_MAX_READS + 5);
+        assert!(selection.sampled_scopes.is_empty());
     }
 
     #[test]
@@ -2924,7 +3065,7 @@ mod tests {
         assert!(!HELP.contains("--random-seed N"));
         assert!(!HELP.contains("--read-stats MODE"));
         assert!(HELP.contains(
-            "--max-reads NAME,N        cap selected reads for a bait label or partition"
+            "--max-reads SCOPE,N|all   cap selected reads, e.g. mito,20000; plastid,all [all,20000]"
         ));
         assert!(!HELP.contains("--preset PRESET"));
         assert!(!HELP.contains("--min-mapq N"));
@@ -3147,6 +3288,36 @@ r2\t100\t0\t80\t+\tplastid_1\t1000\t0\t80\t75\t80\t60\tcg:Z:80M\n";
         assert!(!result.reads["r1"].labels.contains("plastid"));
         assert!(result.reads["r2"].labels.contains("plastid"));
         assert!(!result.reads["r2"].labels.contains("mito"));
+    }
+
+    fn fake_alignment_reads(label: &str, count: usize) -> BTreeMap<String, AlignmentRead> {
+        let mut reads = BTreeMap::new();
+        for index in 0..count {
+            reads.insert(
+                format!("read_{index:05}"),
+                AlignmentRead {
+                    labels: BTreeSet::from([label.to_string()]),
+                    partitions: BTreeSet::from([label.to_string()]),
+                    targets: BTreeSet::new(),
+                    original_targets: BTreeSet::new(),
+                    best_mapq: 60,
+                    best_aln_len: 1_000,
+                    hit_count: 1,
+                },
+            );
+        }
+        reads
+    }
+
+    fn fake_bait_preparation(label: &str) -> BaitPreparation {
+        BaitPreparation {
+            fasta_path: PathBuf::from("bait.fasta"),
+            id_map_path: None,
+            targets: HashMap::new(),
+            labels: BTreeSet::from([label.to_string()]),
+            partitions: BTreeMap::from([(label.to_string(), label.to_string())]),
+            record_count: 1,
+        }
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {

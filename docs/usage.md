@@ -36,7 +36,7 @@ validation rounds. It does not replace the core algorithms in
 
 ```bash
 orgraft workflow template
-orgraft workflow init --out results_workflow/orgraft.workflow.toml
+orgraft workflow init --command-mode classic --out results_workflow/orgraft.workflow.toml
 orgraft workflow plan --config results_workflow/orgraft.workflow.toml
 orgraft workflow run-script --config results_workflow/orgraft.workflow.toml
 orgraft workflow run --config results_workflow/orgraft.workflow.toml
@@ -58,8 +58,12 @@ orgraft workflow test-fake-validate --input-fasta ERROR_POLISH_ALN.fasta --pos-r
 The workflow file is TOML. Generate a starter file instead of hand-writing it:
 
 ```bash
-orgraft workflow init --out results_workflow/orgraft.workflow.toml
+orgraft workflow init --command-mode classic --out results_workflow/orgraft.workflow.toml
 ```
+
+Use `--command-mode detailed` to include file handoff and optional-argument
+notes in generated scripts, or `--command-mode concise` to emit one case-level
+`orgraft workflow run` command.
 
 Minimal shape:
 
@@ -75,8 +79,12 @@ soft_paths = "soft_paths.txt"
 
 [workflow]
 mode = "stepwise"
+# detailed: expanded commands plus file handoffs and common optional arguments.
+# classic: expanded commands with the classic required argument set.
+# concise: one case-level `orgraft workflow run` command per generated script.
+command_mode = "classic"
 max_rounds = 3
-threads = 8
+threads = 64
 force = false
 auto_snv_indel_correction = true
 topology_simple_allowed_classes = "0-0,0-1/1-0,1-1,1-2/2-1,2-2"
@@ -85,32 +93,41 @@ topology_simple_allowed_classes = "0-0,0-1/1-0,1-1,1-2/2-1,2-2"
 enabled = true
 raw_reads = "/path/to/raw_hifi.fastq.gz"
 baits = "mito=/path/to/mito.fasta,plastid=/path/to/plastid.fasta"
-out_dir = "${results_dir}/recruit"
-platform = "HiFi"
-bait_format = "auto"
-gzip_output = true
+out_dir = "${results_dir}/01.recruit"
+threads = 16
+# platform = "HiFi"
+# bait_format = "auto"
+# gzip_output = true
+# max_reads = "all,20000"
 
 [commands.asm]
 enabled = true
-out_dir = "${results_dir}/draft_asm"
-profile = "standard"
+out_dir = "${results_dir}/02.draft_asm"
+threads = 8
+# profile = "standard"
+
+[commands.polish]
+threads = 64
 
 [commands.rebuild]
 enabled = true
-out_dir = "${results_dir}/rebuild"
-threads = 4
+out_dir = "${results_dir}/05.rebuild"
+threads = 16
 
 [workflow.case.mito_subgraph_001]
 enabled = true
 name = "mito_subgraph_001"
 organelle = "mito"
 subgraph = "subgraph_001"
-draft_graph = "${results_dir}/draft_asm/${organelle}/03.finalize_graph/graph.gfa"
+workflow_dir = "${results_dir}/workflow/${organelle}/${subgraph}"
+draft_graph = "${results_dir}/02.draft_asm/${organelle}/03.finalize_graph/graph.gfa"
 checked_draft_gfa = "${results_dir}/workflow/${organelle}/${subgraph}/checkpoint_1/checked_draft.gfa"
-resolve_out_dir = "${results_dir}/resolve_gfa"
-reads = "${results_dir}/recruit/${organelle}.fastq.gz"
-polish_out_dir = "${results_dir}/polish"
-rebuild_out_dir = "${results_dir}/rebuild/${organelle}"
+resolve_out_dir = "${results_dir}/03.resolve_gfa"
+reads = "${results_dir}/01.recruit/${organelle}.fastq.gz"
+linearized_fasta = "${results_dir}/03.resolve_gfa/${organelle}/fasta/resolved_subgraphs.fasta"
+polish_reference = "${results_dir}/03.resolve_gfa/${organelle}/fasta/rotated_reference.fasta"
+polish_out_dir = "${results_dir}/04.polish"
+rebuild_out_dir = "${results_dir}/05.rebuild/${organelle}"
 ```
 
 When `reference` is omitted, workflow uses the matching FASTA from
@@ -140,8 +157,9 @@ enabled = false
 [workflow.case.mito_subgraph_001]
 draft_graph = "${source_results_dir}/draft_asm/${organelle}/03.finalize_graph/graph.gfa"
 reads = "${source_results_dir}/recruit/${organelle}.fastq.gz"
-resolve_out_dir = "${results_dir}/resolve_gfa"
-polish_out_dir = "${results_dir}/polish"
+resolve_out_dir = "${results_dir}/03.resolve_gfa"
+polish_out_dir = "${results_dir}/04.polish"
+rebuild_out_dir = "${results_dir}/05.rebuild/${organelle}"
 ```
 
 This keeps existing `results/` as a reference input and writes new checkpoint,
@@ -167,6 +185,11 @@ Typical workflow outputs:
 results_workflow/
   workflow.commands.sh
   runtime_summary.md
+  01.recruit/
+  02.draft_asm/
+  03.resolve_gfa/
+  04.polish/
+  05.rebuild/
   workflow/
     mito/subgraph_001/
       workflow.commands.sh
@@ -179,11 +202,6 @@ results_workflow/
           checkpoint_2.status.tsv
           pos_ref_alt.txt
           polish_aln_v2.fasta
-  recruit/
-  draft_asm/
-  resolve_gfa/
-  polish/
-  rebuild/
 ```
 
 The generated shell scripts are reproducible runners. Edit the TOML config,
@@ -194,15 +212,15 @@ scripts as the source of truth.
 
 ```bash
 orgraft recruit --reads reads.fastq.gz --mito mito.fa --plastid plastid.fa
-orgraft asm --reads results_workflow/recruit/mito.fastq.gz --organelle mito
+orgraft asm --reads results_workflow/01.recruit/mito.fastq.gz --organelle mito
 orgraft resolve --checked-draft-gfa checked_draft.gfa --reference mito.fa
 orgraft polish --organelle mito --subgraph subgraph_001 --draft resolved_subgraphs.fasta --reference rotated_reference.fasta --reads mito.fastq.gz
 orgraft rebuild --organelle mito --subgraph subgraph_001 --edited-gfa checked_draft.gfa --polished-fasta polish_aln_v2.fasta
 ```
 
-Default output roots are stage-oriented: `results/recruit`,
-`results/draft_asm`, `resolve_gfa`, `results/polish`, and `results/rebuild`,
-unless overridden by workflow config or command options.
+Standalone command defaults remain command-local, such as `results/recruit`,
+`results/draft_asm`, `resolve_gfa`, `results/polish`, and `results/rebuild`.
+The workflow template overrides them with numbered roots under `results_dir`.
 
 ## Correction Smoke Test
 

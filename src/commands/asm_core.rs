@@ -6023,7 +6023,9 @@ fn mito_stable_scoped_candidates(
     match config.mito_stable_selection_mode {
         MitoStableSelectionMode::Auto => candidates,
         #[cfg(test)]
-        MitoStableSelectionMode::ForbidSelected => scoped_mito_stable_candidates(config, candidates),
+        MitoStableSelectionMode::ForbidSelected => {
+            scoped_mito_stable_candidates(config, candidates)
+        }
         MitoStableSelectionMode::AllowSelected => scoped_mito_stable_candidates(config, candidates),
     }
 }
@@ -6035,8 +6037,12 @@ fn scoped_mito_stable_candidates(
     candidates
         .into_iter()
         .filter(|candidate| {
-            config.mito_stable_selected_nodes.contains(&candidate.key.from)
-                || config.mito_stable_selected_nodes.contains(&candidate.key.to)
+            config
+                .mito_stable_selected_nodes
+                .contains(&candidate.key.from)
+                || config
+                    .mito_stable_selected_nodes
+                    .contains(&candidate.key.to)
         })
         .collect()
 }
