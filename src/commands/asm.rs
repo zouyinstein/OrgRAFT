@@ -967,34 +967,14 @@ fn write_core_output_manifest(path: &Path, work_dir: &Path) -> Result<(), Orgraf
             "direct skeleton-linking report",
         ),
         (
-            "06.repeat_aware_resolution/link_selection.report.txt",
-            "06.repeat_aware_resolution",
-            "repeat-aware link selection and topology repair report",
-        ),
-        (
             "06.repeat_aware_resolution/report.txt",
             "06.repeat_aware_resolution",
-            "repeat-aware resolution status report",
+            "repeat-aware resolution, skeleton-link summary, and topology repair report",
         ),
         (
-            "06.repeat_aware_resolution/selected_links.tsv",
+            "06.repeat_aware_resolution/node_repairs.tsv",
             "06.repeat_aware_resolution",
-            "candidate links selected by repeat-aware resolution",
-        ),
-        (
-            "06.repeat_aware_resolution/link_candidates.tsv",
-            "06.repeat_aware_resolution",
-            "candidate links considered by repeat-aware resolution",
-        ),
-        (
-            "06.repeat_aware_resolution/repeat_expansions.tsv",
-            "06.repeat_aware_resolution",
-            "repeat copy expansions accepted during topology repair",
-        ),
-        (
-            "06.repeat_aware_resolution/topology_scan.tsv",
-            "06.repeat_aware_resolution",
-            "node degree classes and repeat-resolution diagnostics",
+            "compact node-level summary of repeat-aware repairs and selected links",
         ),
         (
             "06.repeat_aware_resolution/links.tsv",

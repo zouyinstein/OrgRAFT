@@ -1183,14 +1183,6 @@ fn run_two_round_skeleton_workflow(config: &Config, started: Instant) -> io::Res
             &link_evidence_dir,
             false,
         )?;
-        write_step_status_report(
-            &repeat_resolution_dir,
-            "06.repeat_aware_resolution",
-            "resolved",
-            "repeat-aware mito workflow resolved candidate links and topology repairs",
-            Some(&link_evidence_dir),
-            Some(&repeat_resolution_dir),
-        )?;
         final_graph_source_dir = repeat_resolution_dir.as_path();
     } else if is_mito_compact(config) {
         run_mito_compact_bridge_linking(&round2)?;
@@ -1270,10 +1262,15 @@ fn copy_final_two_round_outputs(evidence_dir: &Path, linked_graph_dir: &Path) ->
         evidence_dir.join("depth.tsv"),
         linked_graph_dir.join("depth.tsv"),
     )?;
-    copy_if_exists(
-        evidence_dir.join("linking.report.txt"),
-        linked_graph_dir.join("report.txt"),
-    )?;
+    let report = evidence_dir.join("report.txt");
+    if report.exists() {
+        fs::copy(report, linked_graph_dir.join("report.txt"))?;
+    } else {
+        copy_if_exists(
+            evidence_dir.join("linking.report.txt"),
+            linked_graph_dir.join("report.txt"),
+        )?;
+    }
     Ok(())
 }
 
@@ -5400,37 +5397,43 @@ fn run_mito_compact_bridge_linking(config: &Config) -> io::Result<()> {
 }
 
 fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io::Result<()> {
+    run_skeleton_linking(config)?;
+    let resolution_dir = resolution_dir.unwrap_or(config.out_dir.as_path());
+    run_mito_stable_resolution(config, resolution_dir)
+}
+
+fn run_mito_stable_resolution(config: &Config, resolution_dir: &Path) -> io::Result<()> {
     let skeleton_gfa = config
         .skeleton_gfa
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--skeleton-gfa is required"))?;
-    let (mut segments, mut skeleton_links) = read_skeleton_gfa(skeleton_gfa)?;
+
+    let linked_gfa = config.out_dir.join("graph.gfa");
+    let (mut segments, _) = read_skeleton_gfa(&linked_gfa)?;
     if segments.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} has no S records", skeleton_gfa.display()),
+            format!("{} has no S records", linked_gfa.display()),
         ));
     }
+    let mut base_links = read_skeleton_links_tsv(&config.out_dir.join("links.tsv"))?;
+    let mut depth = read_skeleton_depth_tsv(&config.out_dir.join("depth.tsv"))?;
 
-    fs::create_dir_all(&config.out_dir)?;
     let mut resolution_config = config.clone();
-    if let Some(resolution_dir) = resolution_dir {
-        resolution_config.out_dir = resolution_dir.to_path_buf();
-    }
+    resolution_config.out_dir = resolution_dir.to_path_buf();
     fs::create_dir_all(&resolution_config.out_dir)?;
-
-    let skeleton_fasta = config.out_dir.join("skeleton_segments.fasta");
-    write_skeleton_fasta(&skeleton_fasta, &segments)?;
+    if !config.keep_debug_files {
+        cleanup_mito_stable_debug_outputs(&resolution_config)?;
+    }
 
     let paf_path = config.out_dir.join("read_alignments.paf");
     let log_path = config.out_dir.join("read_alignments.minimap2.log");
-    run_minimap2_to_target(config, &skeleton_fasta, &paf_path, &log_path)?;
-
-    let presplit_paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
-    let split_points =
-        detect_mito_stable_internal_split_points(config, &segments, &presplit_paf_by_read);
+    let mut paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
+    let split_points = detect_mito_stable_internal_split_points(config, &segments, &paf_by_read);
     let mut split_report = Vec::new();
+    let mut candidates = Vec::new();
     if !split_points.is_empty() {
+        let skeleton_fasta = resolution_config.out_dir.join("skeleton_segments.fasta");
         let presplit_fasta = resolution_config
             .out_dir
             .join("presplit_skeleton_segments.fasta");
@@ -5440,47 +5443,63 @@ fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io
         let presplit_log = resolution_config
             .out_dir
             .join("read_alignments.presplit.minimap2.log");
-        fs::copy(&skeleton_fasta, presplit_fasta)?;
+        fs::copy(
+            config.out_dir.join("skeleton_segments.fasta"),
+            presplit_fasta,
+        )?;
         fs::copy(&paf_path, presplit_paf)?;
         if log_path.exists() {
             fs::copy(&log_path, presplit_log)?;
         }
         let (refined_segments, refined_links, refined_report) =
-            apply_mito_stable_internal_splits(config, segments, skeleton_links, split_points);
+            apply_mito_stable_internal_splits(config, segments, base_links, split_points);
         segments = refined_segments;
-        skeleton_links = refined_links;
+        base_links = refined_links;
         split_report = refined_report;
         write_skeleton_fasta(&skeleton_fasta, &segments)?;
-        run_minimap2_to_target(config, &skeleton_fasta, &paf_path, &log_path)?;
-    }
+        let refined_paf_path = resolution_config.out_dir.join("read_alignments.paf");
+        let refined_log_path = resolution_config
+            .out_dir
+            .join("read_alignments.minimap2.log");
+        run_minimap2_to_target(
+            config,
+            &skeleton_fasta,
+            &refined_paf_path,
+            &refined_log_path,
+        )?;
 
-    let (mut depth, paf_links) = summarize_skeleton_paf(config, &segments, &paf_path)?;
-    let paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
+        for support in base_links.values_mut() {
+            support.paf_support = 0;
+            support.out_ratio = 0.0;
+            support.in_ratio = 0.0;
+        }
+        let (refined_depth, refined_paf_links) =
+            summarize_skeleton_paf(config, &segments, &refined_paf_path)?;
+        depth = refined_depth;
+        let (refined_base_links, refined_candidates) =
+            mito_stable_base_links_and_paf_candidates(base_links, refined_paf_links);
+        base_links = refined_base_links;
+        candidates = refined_candidates;
+        paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &refined_paf_path)?;
+    }
+    candidates.extend(mito_stable_candidates_from_filtered_links(
+        config,
+        &base_links,
+    ));
     let rescue_links = match &config.skeleton_rescue_gfa {
         Some(rescue_gfa) => read_gfa_links(rescue_gfa)?,
         None => HashMap::new(),
     };
 
-    let (mut base_links, mut candidates) =
-        mito_stable_base_links_and_paf_candidates(skeleton_links, paf_links);
-    add_rescue_links(config, &mut base_links, rescue_links.clone());
     refresh_skeleton_link_ratios(config, &mut base_links);
-    write_skeleton_depth(&config.out_dir.join("depth.tsv"), &segments, &depth)?;
-    write_skeleton_links(&config.out_dir.join("links.tsv"), &base_links)?;
-    write_skeleton_linked_gfa(
-        config,
-        &config.out_dir.join("graph.gfa"),
-        &segments,
-        &depth,
-        &base_links,
-    )?;
-    write_skeleton_report(config, skeleton_gfa, &segments, &base_links)?;
     let initial_stats = skeleton_graph_stats(config, &segments, &base_links);
     candidates
         .retain(|candidate| mito_compact_candidate_is_relevant(&initial_stats, &candidate.key));
 
     let focused_reads = mito_compact_focused_reads(&initial_stats, &paf_by_read);
-    write_mito_compact_focused_reads(&resolution_config, &focused_reads)?;
+    if config.keep_debug_files {
+        write_mito_compact_focused_reads(&resolution_config, &focused_reads)?;
+    }
     candidates.extend(mito_compact_local_paf_candidates(
         config,
         &initial_stats,
@@ -5580,9 +5599,12 @@ fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io
         &depth,
         &final_links,
     )?;
-    write_skeleton_report(&resolution_config, skeleton_gfa, &segments, &final_links)?;
     write_mito_stable_bridge_report(
         &resolution_config,
+        config.out_dir.as_path(),
+        skeleton_gfa,
+        &segments,
+        &final_links,
         &base_topology,
         &final_topology,
         &candidates,
@@ -5596,12 +5618,19 @@ fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io
         node_constraint_fallback,
         final_node_shape_violations,
     )?;
-    write_mito_stable_repeat_expansions(&resolution_config, &repeat_expansions)?;
-    write_mito_stable_pruned_links(&resolution_config, &pruned_links)?;
-    write_mito_stable_manual_edits(&resolution_config, &manual_edits)?;
-    write_mito_stable_copy_choices(&resolution_config, &copy_choice_rows)?;
-    write_mito_stable_selected_node_diagnostics(&resolution_config, &selected_node_diagnostics)?;
-    write_mito_stable_node_degrees(&resolution_config, &segments, &final_links)?;
+    if config.keep_debug_files {
+        write_mito_stable_repeat_expansions(&resolution_config, &repeat_expansions)?;
+        write_mito_stable_pruned_links(&resolution_config, &pruned_links)?;
+        write_mito_stable_manual_edits(&resolution_config, &manual_edits)?;
+        write_mito_stable_copy_choices(&resolution_config, &copy_choice_rows)?;
+        write_mito_stable_selected_node_diagnostics(
+            &resolution_config,
+            &selected_node_diagnostics,
+        )?;
+        write_mito_stable_node_degrees(&resolution_config, &segments, &final_links)?;
+        write_mito_stable_topology_scan(&resolution_config, &segments, &final_links)?;
+        write_mito_stable_split_report(&resolution_config, &split_report)?;
+    }
     write_mito_stable_node_repairs(
         &resolution_config,
         &segments,
@@ -5612,8 +5641,9 @@ fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io
         &pruned_links,
         &repeat_expansions,
     )?;
-    write_mito_stable_topology_scan(&resolution_config, &segments, &final_links)?;
-    write_mito_stable_split_report(&resolution_config, &split_report)?;
+    if !config.keep_debug_files {
+        cleanup_mito_stable_debug_outputs(&resolution_config)?;
+    }
     Ok(())
 }
 
@@ -5952,6 +5982,21 @@ fn mito_stable_base_links_and_paf_candidates(
         }
     }
     (base_links, candidates)
+}
+
+fn mito_stable_candidates_from_filtered_links(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> Vec<MitoCompactBridgeCandidate> {
+    links
+        .iter()
+        .filter(|(_, support)| support.paf_support > 0 && !keep_skeleton_link(config, support))
+        .map(|(key, support)| MitoCompactBridgeCandidate {
+            key: key.clone(),
+            support: support.paf_support,
+            source: MitoCompactBridgeSource::LocalPaf,
+        })
+        .collect()
 }
 
 fn dedupe_mito_bridge_candidates(
@@ -7565,6 +7610,121 @@ fn read_skeleton_gfa(
     Ok((segments, links))
 }
 
+fn read_skeleton_depth_tsv(path: &Path) -> io::Result<HashMap<String, (usize, usize)>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut depth = HashMap::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line_number == 0 && line.starts_with("segment\t") {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: expected at least 5 depth fields",
+                    path.display(),
+                    line_number + 1
+                ),
+            ));
+        }
+        let aligned_bases = fields[2].parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: invalid aligned_bases value",
+                    path.display(),
+                    line_number + 1
+                ),
+            )
+        })?;
+        let alignments = fields[4].parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: invalid alignments value",
+                    path.display(),
+                    line_number + 1
+                ),
+            )
+        })?;
+        depth.insert(fields[0].to_string(), (aligned_bases, alignments));
+    }
+    Ok(depth)
+}
+
+fn read_skeleton_links_tsv(
+    path: &Path,
+) -> io::Result<HashMap<SkeletonLinkKey, SkeletonLinkSupport>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut links = HashMap::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line_number == 0 && line.starts_with("from\t") {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 9 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: expected at least 9 link fields",
+                    path.display(),
+                    line_number + 1
+                ),
+            ));
+        }
+        let parse_u32_field = |index: usize, name: &str| -> io::Result<u32> {
+            fields[index].parse::<u32>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}:{}: invalid {name} value",
+                        path.display(),
+                        line_number + 1
+                    ),
+                )
+            })
+        };
+        let parse_f64_field = |index: usize, name: &str| -> io::Result<f64> {
+            fields[index].parse::<f64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}:{}: invalid {name} value",
+                        path.display(),
+                        line_number + 1
+                    ),
+                )
+            })
+        };
+        let key = SkeletonLinkKey {
+            from: fields[0].to_string(),
+            from_orient: fields[1].chars().next().unwrap_or('+'),
+            to: fields[2].to_string(),
+            to_orient: fields[3].chars().next().unwrap_or('+'),
+        };
+        links.insert(
+            key,
+            SkeletonLinkSupport {
+                skeleton_support: parse_u32_field(4, "skeleton_support")?,
+                paf_support: parse_u32_field(5, "paf_support")?,
+                rescue_support: parse_u32_field(6, "rescue_support")?,
+                out_ratio: parse_f64_field(7, "out_ratio")?,
+                in_ratio: parse_f64_field(8, "in_ratio")?,
+            },
+        );
+    }
+    Ok(links)
+}
+
 fn read_gfa_links(path: &Path) -> io::Result<HashMap<SkeletonLinkKey, u32>> {
     let reader = BufReader::new(File::open(path)?);
     let mut links: HashMap<SkeletonLinkKey, u32> = HashMap::new();
@@ -8250,8 +8410,43 @@ fn write_mito_compact_bridge_report(
     Ok(())
 }
 
+fn cleanup_mito_stable_debug_outputs(config: &Config) -> io::Result<()> {
+    for relative in [
+        "focused_read_ids.txt",
+        "link_selection.report.txt",
+        "linking.report.txt",
+        "selected_links.tsv",
+        "link_candidates.tsv",
+        "repeat_expansions.tsv",
+        "redundant_links_pruned.tsv",
+        "manual_link_edits.tsv",
+        "copy_choice_links.tsv",
+        "constrained_nodes.tsv",
+        "node_degrees.tsv",
+        "topology_scan.tsv",
+        "segment_splits.tsv",
+        "skeleton_segments.fasta",
+        "presplit_skeleton_segments.fasta",
+        "read_alignments.paf",
+        "read_alignments.minimap2.log",
+        "read_alignments.presplit.paf",
+        "read_alignments.presplit.minimap2.log",
+    ] {
+        match fs::remove_file(config.out_dir.join(relative)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn write_mito_stable_bridge_report(
     config: &Config,
+    input_dir: &Path,
+    skeleton_gfa: &Path,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
     initial: &MitoStableTopologyStats,
     final_stats: &MitoStableTopologyStats,
     candidates: &[MitoCompactBridgeCandidate],
@@ -8265,8 +8460,25 @@ fn write_mito_stable_bridge_report(
     node_constraint_fallback: bool,
     final_node_shape_violations: usize,
 ) -> io::Result<()> {
-    let mut out = File::create(config.out_dir.join("link_selection.report.txt"))?;
-    writeln!(out, "link_selection_report")?;
+    match fs::remove_file(config.out_dir.join("selected_links.tsv")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut out = File::create(config.out_dir.join("report.txt"))?;
+    writeln!(out, "repeat_aware_resolution_report")?;
+    writeln!(out, "step\t06.repeat_aware_resolution")?;
+    writeln!(out, "status\tresolved")?;
+    writeln!(
+        out,
+        "reason\trepeat-aware mito workflow resolved candidate links and topology repairs"
+    )?;
+    writeln!(out, "input_dir\t{}", input_dir.display())?;
+    writeln!(out, "output_dir\t{}", config.out_dir.display())?;
+    writeln!(out, "section\tskeleton_link_summary")?;
+    write_skeleton_report_fields(&mut out, config, skeleton_gfa, segments, links)?;
+    writeln!(out, "section\trepeat_aware_selection")?;
     writeln!(out, "mode\tglobal_candidate_selection")?;
     writeln!(
         out,
@@ -8344,6 +8556,7 @@ fn write_mito_stable_bridge_report(
     )?;
     writeln!(out, "repeat_expansions\t{}", repeat_expansions.len())?;
     writeln!(out, "pruned_redundant_links\t{}", pruned_links.len())?;
+    writeln!(out, "debug_files\t{}", config.keep_debug_files)?;
     writeln!(out, "final_components\t{}", final_stats.components)?;
     writeln!(out, "final_open_ends\t{}", final_stats.open_ends)?;
     writeln!(
@@ -8355,49 +8568,33 @@ fn write_mito_stable_bridge_report(
     writeln!(out, "final_branch_ends\t{}", final_stats.branch_ends)?;
     writeln!(out, "final_cycle_rank\t{}", final_stats.cycle_rank)?;
 
-    let mut candidate_out = File::create(config.out_dir.join("link_candidates.tsv"))?;
-    writeln!(
-        candidate_out,
-        "selected\tfrom\tfrom_orient\tto\tto_orient\tsource\tsupport"
-    )?;
-    let selected_keys: HashSet<_> = selected
-        .iter()
-        .map(|candidate| canonical_skeleton_link_key(&candidate.key))
-        .collect();
-    for candidate in candidates {
-        let key = &candidate.key;
-        let selected = selected_keys.contains(&canonical_skeleton_link_key(key));
+    if config.keep_debug_files {
+        let mut candidate_out = File::create(config.out_dir.join("link_candidates.tsv"))?;
         writeln!(
             candidate_out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            selected,
-            key.from,
-            key.from_orient,
-            key.to,
-            key.to_orient,
-            candidate.source.label(),
-            candidate.support
+            "selected\tfrom\tfrom_orient\tto\tto_orient\tsource\tsupport"
         )?;
+        let selected_keys: HashSet<_> = selected
+            .iter()
+            .map(|candidate| canonical_skeleton_link_key(&candidate.key))
+            .collect();
+        for candidate in candidates {
+            let key = &candidate.key;
+            let selected = selected_keys.contains(&canonical_skeleton_link_key(key));
+            writeln!(
+                candidate_out,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                selected,
+                key.from,
+                key.from_orient,
+                key.to,
+                key.to_orient,
+                candidate.source.label(),
+                candidate.support
+            )?;
+        }
     }
 
-    let mut selected_out = File::create(config.out_dir.join("selected_links.tsv"))?;
-    writeln!(
-        selected_out,
-        "from\tfrom_orient\tto\tto_orient\tsource\tsupport"
-    )?;
-    for candidate in selected {
-        let key = &candidate.key;
-        writeln!(
-            selected_out,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            key.from,
-            key.from_orient,
-            key.to,
-            key.to_orient,
-            candidate.source.label(),
-            candidate.support
-        )?;
-    }
     Ok(())
 }
 
@@ -8589,11 +8786,12 @@ fn write_mito_stable_node_repairs(
 
     for candidate in selected {
         let event = format!(
-            "selected_bridge:{}:{}:{}:{}:{}",
+            "selected_link:{}:{}:{}:{}:{}:{}",
             candidate.key.from,
             candidate.key.from_orient,
             candidate.key.to,
             candidate.key.to_orient,
+            candidate.source.label(),
             candidate.support
         );
         record_mito_stable_link_event(&mut events, &candidate.key, event);
@@ -9252,6 +9450,16 @@ fn write_skeleton_report(
     links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
 ) -> io::Result<()> {
     let mut out = File::create(config.out_dir.join("linking.report.txt"))?;
+    write_skeleton_report_fields(&mut out, config, skeleton_gfa, segments, links)
+}
+
+fn write_skeleton_report_fields<W: Write>(
+    out: &mut W,
+    config: &Config,
+    skeleton_gfa: &Path,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> io::Result<()> {
     let kept = links
         .values()
         .filter(|support| keep_skeleton_link(config, support))
