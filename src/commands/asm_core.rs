@@ -5317,7 +5317,7 @@ fn run_skeleton_linking(config: &Config) -> io::Result<()> {
     let mut merged_links = merge_skeleton_links(config, skeleton_links, paf_links);
     if let Some(rescue_gfa) = &config.skeleton_rescue_gfa {
         let rescue_links = read_gfa_links(rescue_gfa)?;
-        add_component_rescue_links(config, &segments, &mut merged_links, rescue_links);
+        add_rescue_links(config, &mut merged_links, rescue_links);
     }
     write_skeleton_links(&config.out_dir.join("links.tsv"), &merged_links)?;
     write_skeleton_linked_gfa(
@@ -5463,6 +5463,7 @@ fn run_mito_stable_linking(config: &Config, resolution_dir: Option<&Path>) -> io
 
     let (mut base_links, mut candidates) =
         mito_stable_base_links_and_paf_candidates(skeleton_links, paf_links);
+    add_rescue_links(config, &mut base_links, rescue_links.clone());
     refresh_skeleton_link_ratios(config, &mut base_links);
     write_skeleton_depth(&config.out_dir.join("depth.tsv"), &segments, &depth)?;
     write_skeleton_links(&config.out_dir.join("links.tsv"), &base_links)?;
@@ -7593,71 +7594,21 @@ fn read_gfa_links(path: &Path) -> io::Result<HashMap<SkeletonLinkKey, u32>> {
     Ok(links)
 }
 
-fn add_component_rescue_links(
+fn add_rescue_links(
     config: &Config,
-    segments: &[SkeletonSegment],
     links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
     rescue_links: HashMap<SkeletonLinkKey, u32>,
 ) {
-    let components = skeleton_components(config, segments, links);
-    for (key, support) in rescue_links {
+    let mut rescue_rows: Vec<_> = rescue_links.into_iter().collect();
+    rescue_rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    for (key, support) in rescue_rows {
         if support < config.skeleton_rescue_link_support {
             continue;
         }
-        let Some(&from_component) = components.get(&key.from) else {
-            continue;
-        };
-        let Some(&to_component) = components.get(&key.to) else {
-            continue;
-        };
-        if from_component == to_component {
-            continue;
-        }
-        links.entry(key).or_default().rescue_support = support;
+        let entry = links.entry(key).or_default();
+        entry.rescue_support = entry.rescue_support.max(support);
     }
-}
-
-fn skeleton_components(
-    config: &Config,
-    segments: &[SkeletonSegment],
-    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
-) -> HashMap<String, usize> {
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    for segment in segments {
-        adj.entry(segment.name.clone()).or_default();
-    }
-    for (key, support) in links {
-        if !keep_skeleton_link(config, support) {
-            continue;
-        }
-        adj.entry(key.from.clone())
-            .or_default()
-            .push(key.to.clone());
-        adj.entry(key.to.clone())
-            .or_default()
-            .push(key.from.clone());
-    }
-    let mut component = HashMap::new();
-    let mut next_component = 0usize;
-    for segment in segments {
-        if component.contains_key(&segment.name) {
-            continue;
-        }
-        next_component += 1;
-        let mut stack = vec![segment.name.clone()];
-        component.insert(segment.name.clone(), next_component);
-        while let Some(node) = stack.pop() {
-            if let Some(neighbors) = adj.get(&node) {
-                for neighbor in neighbors {
-                    if !component.contains_key(neighbor) {
-                        component.insert(neighbor.clone(), next_component);
-                        stack.push(neighbor.clone());
-                    }
-                }
-            }
-        }
-    }
-    component
 }
 
 fn read_filtered_skeleton_paf_by_read(
@@ -10152,6 +10103,81 @@ mod tests {
         );
         assert!(stats.open_out.contains(&("utg1".to_string(), '+')));
         assert!(stats.open_in.contains(&("utg0".to_string(), '+')));
+    }
+
+    #[test]
+    fn rescue_links_keep_read_junction_graph_links() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "mito",
+                "-i",
+                "reads.fastq.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+        let mut links = HashMap::new();
+        links.insert(
+            SkeletonLinkKey {
+                from: "utg8".to_string(),
+                from_orient: '-',
+                to: "utg16".to_string(),
+                to_orient: '-',
+            },
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+
+        let open_closure = SkeletonLinkKey {
+            from: "utg8".to_string(),
+            from_orient: '+',
+            to: "utg16".to_string(),
+            to_orient: '+',
+        };
+        let non_closing_same_component = SkeletonLinkKey {
+            from: "utg8".to_string(),
+            from_orient: '-',
+            to: "utg16".to_string(),
+            to_orient: '+',
+        };
+        let mut rescue_links = HashMap::new();
+        rescue_links.insert(open_closure.clone(), config.skeleton_rescue_link_support);
+        rescue_links.insert(
+            non_closing_same_component.clone(),
+            config.skeleton_rescue_link_support,
+        );
+        let below_rescue_floor = SkeletonLinkKey {
+            from: "utg16".to_string(),
+            from_orient: '+',
+            to: "utg8".to_string(),
+            to_orient: '+',
+        };
+        rescue_links.insert(
+            below_rescue_floor.clone(),
+            config.skeleton_rescue_link_support - 1,
+        );
+
+        add_rescue_links(&config, &mut links, rescue_links);
+
+        assert_eq!(
+            links
+                .get(&open_closure)
+                .map(|support| support.rescue_support),
+            Some(config.skeleton_rescue_link_support)
+        );
+        assert_eq!(
+            links
+                .get(&non_closing_same_component)
+                .map(|support| support.rescue_support),
+            Some(config.skeleton_rescue_link_support)
+        );
+        assert!(!links.contains_key(&below_rescue_floor));
     }
 
     #[test]

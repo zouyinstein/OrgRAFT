@@ -5,4 +5,6 @@
 *.tmp
 .DS_Store
 results
+results_workflow
 orgraft
+docs/rust-handbook
