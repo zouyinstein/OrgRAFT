@@ -2202,30 +2202,465 @@ fn deduplicate_links(graph: &mut GfaGraph) -> usize {
     before - graph.links.len()
 }
 
-fn order_auto_repeat_candidates(
-    mut candidates: Vec<AutoRepeatCandidate>,
-) -> Vec<AutoRepeatCandidate> {
-    candidates.sort_by(|left, right| {
-        auto_repeat_candidate_key(left).cmp(&auto_repeat_candidate_key(right))
+fn order_auto_repeat_candidates(candidates: Vec<AutoRepeatCandidate>) -> Vec<AutoRepeatCandidate> {
+    let mut indexed = candidates.into_iter().enumerate().collect::<Vec<_>>();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        auto_repeat_candidate_key(left, *left_index)
+            .cmp(&auto_repeat_candidate_key(right, *right_index))
     });
-    candidates
+    indexed
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
-fn auto_repeat_candidate_key(candidate: &AutoRepeatCandidate) -> (u8, usize, String, String) {
-    match merge_graph_to_sequence(&candidate.graph) {
+fn auto_repeat_candidate_key(
+    candidate: &AutoRepeatCandidate,
+    original_index: usize,
+) -> (u8, usize, String, String, usize) {
+    match gfa_editor_merge_all_sequence(&candidate.graph) {
         Ok(merged) => (
             0,
-            merged.sequence.len(),
-            head_to_tail_sequence_feature(&merged.sequence),
+            merged.len(),
+            head_to_tail_sequence_feature(&merged),
             candidate.signature.clone(),
+            original_index,
         ),
         Err(_) => (
             1,
             candidate.graph.segments.len(),
             String::new(),
             candidate.signature.clone(),
+            original_index,
         ),
     }
+}
+
+fn gfa_editor_merge_all_sequence(graph: &GfaGraph) -> Result<String, OrgraftError> {
+    if graph.segments.is_empty() {
+        return Err(OrgraftError::InvalidArgument(
+            "cannot merge an empty graph".to_string(),
+        ));
+    }
+    if graph.segments.len() == 1 {
+        let segment = graph
+            .ordered_segments()
+            .first()
+            .copied()
+            .or_else(|| graph.segments.values().next())
+            .unwrap();
+        return Ok(segment.sequence.clone());
+    }
+
+    let mut merged_graph = graph.clone();
+    let node_ids = merged_graph.ordered_segment_names();
+    let (path_node_ids, retained_cycle_link) =
+        gfa_editor_selected_merge_path(&merged_graph, &node_ids)?;
+    if let Some(retained_index) = retained_cycle_link {
+        if retained_index < merged_graph.links.len() {
+            merged_graph.links.remove(retained_index);
+        }
+    }
+
+    let mut current_node_id = path_node_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| OrgraftError::InvalidArgument("empty merge path".to_string()))?;
+    for next_node_id in path_node_ids.iter().skip(1) {
+        current_node_id = gfa_editor_merge_unique_link_between(
+            &mut merged_graph,
+            &current_node_id,
+            next_node_id,
+        )?;
+    }
+    merged_graph
+        .segments
+        .get(&current_node_id)
+        .map(|segment| segment.sequence.clone())
+        .ok_or_else(|| {
+            OrgraftError::InvalidArgument(
+                "GFA_Editor-style merge did not produce a segment".to_string(),
+            )
+        })
+}
+
+fn gfa_editor_selected_merge_path(
+    graph: &GfaGraph,
+    node_ids: &[String],
+) -> Result<(Vec<String>, Option<usize>), OrgraftError> {
+    let selected = node_ids.iter().cloned().collect::<HashSet<_>>();
+    let internal_links = graph
+        .links
+        .iter()
+        .enumerate()
+        .filter(|(_, link)| {
+            selected.contains(&link.from_name)
+                && selected.contains(&link.to_name)
+                && link.from_name != link.to_name
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut adjacency = node_ids
+        .iter()
+        .map(|node_id| (node_id.clone(), Vec::<usize>::new()))
+        .collect::<HashMap<_, _>>();
+    let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+    for link_index in &internal_links {
+        let link = &graph.links[*link_index];
+        let pair = sorted_pair(&link.from_name, &link.to_name);
+        *pair_counts.entry(pair).or_default() += 1;
+        adjacency
+            .entry(link.from_name.clone())
+            .or_default()
+            .push(*link_index);
+        adjacency
+            .entry(link.to_name.clone())
+            .or_default()
+            .push(*link_index);
+    }
+
+    if selected.len() == 2 && internal_links.len() == 2 {
+        return Ok((node_ids.to_vec(), Some(internal_links[1])));
+    }
+    if pair_counts.values().any(|count| *count != 1) {
+        return Err(OrgraftError::InvalidArgument(
+            "selected contigs must have exactly one link between each connected pair".to_string(),
+        ));
+    }
+    if internal_links.len() == selected.len() {
+        return gfa_editor_selected_merge_cycle_path(graph, node_ids, &adjacency);
+    }
+    if internal_links.len() != selected.len().saturating_sub(1) {
+        return Err(OrgraftError::InvalidArgument(
+            "selected contigs must form a single path or simple cycle".to_string(),
+        ));
+    }
+
+    let endpoints = node_ids
+        .iter()
+        .filter(|node_id| adjacency.get(*node_id).map(Vec::len).unwrap_or(0) == 1)
+        .cloned()
+        .collect::<Vec<_>>();
+    let middle_count = node_ids
+        .iter()
+        .filter(|node_id| adjacency.get(*node_id).map(Vec::len).unwrap_or(0) == 2)
+        .count();
+    let valid_degrees = if selected.len() == 2 {
+        endpoints.len() == 2
+    } else {
+        endpoints.len() == 2 && middle_count == selected.len().saturating_sub(2)
+    };
+    if !valid_degrees {
+        return Err(OrgraftError::InvalidArgument(
+            "selected contigs must form one unbranched head-to-tail path".to_string(),
+        ));
+    }
+
+    let start_node_id = endpoints
+        .iter()
+        .min_by_key(|node_id| {
+            node_ids
+                .iter()
+                .position(|candidate| candidate == *node_id)
+                .unwrap_or(usize::MAX)
+        })
+        .cloned()
+        .unwrap();
+    let mut path_node_ids = vec![start_node_id.clone()];
+    let mut seen = HashSet::from([start_node_id.clone()]);
+    let mut previous_node_id: Option<String> = None;
+    let mut current_node_id = start_node_id;
+    while path_node_ids.len() < selected.len() {
+        let candidates = adjacency
+            .get(&current_node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|link_index| {
+                previous_node_id.as_ref()
+                    != Some(&other_link_node(
+                        &graph.links[*link_index],
+                        &current_node_id,
+                    ))
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(OrgraftError::InvalidArgument(
+                "selected contigs must form one unbranched head-to-tail path".to_string(),
+            ));
+        }
+        let next_node_id = other_link_node(&graph.links[candidates[0]], &current_node_id);
+        if !seen.insert(next_node_id.clone()) {
+            return Err(OrgraftError::InvalidArgument(
+                "selected contigs must form one unbranched head-to-tail path".to_string(),
+            ));
+        }
+        path_node_ids.push(next_node_id.clone());
+        previous_node_id = Some(current_node_id);
+        current_node_id = next_node_id;
+    }
+    Ok((path_node_ids, None))
+}
+
+fn gfa_editor_selected_merge_cycle_path(
+    graph: &GfaGraph,
+    node_ids: &[String],
+    adjacency: &HashMap<String, Vec<usize>>,
+) -> Result<(Vec<String>, Option<usize>), OrgraftError> {
+    if node_ids.len() < 3
+        || node_ids
+            .iter()
+            .any(|node_id| adjacency.get(node_id).map(Vec::len).unwrap_or(0) != 2)
+    {
+        return Err(OrgraftError::InvalidArgument(
+            "selected contigs must form one simple cycle".to_string(),
+        ));
+    }
+    let start_node_id = node_ids[0].clone();
+    let start_links = adjacency.get(&start_node_id).cloned().unwrap_or_default();
+    let first_link = start_links
+        .iter()
+        .copied()
+        .find(|link_index| {
+            node_ids.len() > 1
+                && other_link_node(&graph.links[*link_index], &start_node_id) == node_ids[1]
+        })
+        .or_else(|| start_links.first().copied())
+        .ok_or_else(|| {
+            OrgraftError::InvalidArgument("selected contigs must form one simple cycle".to_string())
+        })?;
+    let mut path_node_ids = vec![start_node_id.clone()];
+    let mut seen = HashSet::from([start_node_id.clone()]);
+    let mut previous_link: Option<usize> = None;
+    let mut current_node_id = start_node_id;
+
+    while path_node_ids.len() < node_ids.len() {
+        let mut candidates = adjacency
+            .get(&current_node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|link_index| Some(*link_index) != previous_link)
+            .collect::<Vec<_>>();
+        if current_node_id == node_ids[0] {
+            candidates = vec![first_link];
+        }
+        if candidates.len() != 1 {
+            return Err(OrgraftError::InvalidArgument(
+                "selected contigs must form one simple cycle".to_string(),
+            ));
+        }
+        let link_index = candidates[0];
+        let next_node_id = other_link_node(&graph.links[link_index], &current_node_id);
+        if !seen.insert(next_node_id.clone()) {
+            return Err(OrgraftError::InvalidArgument(
+                "selected contigs must form one simple cycle".to_string(),
+            ));
+        }
+        path_node_ids.push(next_node_id.clone());
+        previous_link = Some(link_index);
+        current_node_id = next_node_id;
+    }
+
+    let retained_candidates = adjacency
+        .get(&current_node_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|link_index| Some(*link_index) != previous_link)
+        .filter(|link_index| {
+            other_link_node(&graph.links[*link_index], &current_node_id) == node_ids[0]
+        })
+        .collect::<Vec<_>>();
+    if retained_candidates.len() != 1 || seen != node_ids.iter().cloned().collect::<HashSet<_>>() {
+        return Err(OrgraftError::InvalidArgument(
+            "selected contigs must form one simple cycle".to_string(),
+        ));
+    }
+    Ok((path_node_ids, Some(retained_candidates[0])))
+}
+
+fn gfa_editor_merge_unique_link_between(
+    graph: &mut GfaGraph,
+    first_node_id: &str,
+    second_node_id: &str,
+) -> Result<String, OrgraftError> {
+    let matches = graph
+        .links
+        .iter()
+        .enumerate()
+        .filter(|(_, link)| {
+            link.from_name != link.to_name
+                && ((link.from_name == first_node_id && link.to_name == second_node_id)
+                    || (link.from_name == second_node_id && link.to_name == first_node_id))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(OrgraftError::InvalidArgument(
+            "merge path no longer has exactly one link between adjacent contigs".to_string(),
+        ));
+    }
+    gfa_editor_merge_link(graph, matches[0])
+}
+
+fn gfa_editor_merge_link(graph: &mut GfaGraph, link_index: usize) -> Result<String, OrgraftError> {
+    let merge_link_record = graph
+        .links
+        .get(link_index)
+        .cloned()
+        .ok_or_else(|| OrgraftError::InvalidArgument("link not found".to_string()))?;
+    let source_id = merge_link_record.from_name.clone();
+    let target_id = merge_link_record.to_name.clone();
+    if source_id == target_id {
+        return Err(OrgraftError::InvalidArgument(
+            "cannot merge a self-link".to_string(),
+        ));
+    }
+    let source_segment = graph.segments.get(&source_id).cloned().ok_or_else(|| {
+        OrgraftError::InvalidArgument(format!("cannot merge missing segment `{source_id}`"))
+    })?;
+    let target_segment = graph.segments.get(&target_id).cloned().ok_or_else(|| {
+        OrgraftError::InvalidArgument(format!("cannot merge missing segment `{target_id}`"))
+    })?;
+    let overlap = overlap_length_from_cigar(&merge_link_record.overlap)
+        .min(source_segment.sequence.len())
+        .min(target_segment.sequence.len());
+    let new_id = next_merged_id(graph, &source_id, &target_id);
+    let source_sequence = if merge_link_record.from_orient == '-' {
+        reverse_complement(&source_segment.sequence)
+    } else {
+        source_segment.sequence.clone()
+    };
+    let target_sequence = if merge_link_record.to_orient == '-' {
+        reverse_complement(&target_segment.sequence)
+    } else {
+        target_segment.sequence.clone()
+    };
+    let mut sequence = source_sequence;
+    sequence.push_str(&target_sequence[overlap.min(target_sequence.len())..]);
+
+    let mut rewired_links = Vec::new();
+    for (index, link) in graph.links.clone().into_iter().enumerate() {
+        if index == link_index {
+            continue;
+        }
+        let touches_source = link.from_name == source_id || link.to_name == source_id;
+        let touches_target = link.from_name == target_id || link.to_name == target_id;
+        if touches_source && touches_target {
+            return Err(OrgraftError::InvalidArgument(
+                "cannot merge nodes with links that would become self-links".to_string(),
+            ));
+        }
+        let mut duplicate = link;
+        if touches_source {
+            replace_link_endpoint(&mut duplicate, &source_id, &new_id, '-');
+        }
+        if touches_target {
+            replace_link_endpoint(&mut duplicate, &target_id, &new_id, '+');
+        }
+        rewired_links.push(duplicate);
+    }
+
+    let mut new_segment_order = Vec::new();
+    let mut inserted = false;
+    for segment_id in &graph.segment_order {
+        if segment_id == &source_id {
+            new_segment_order.push(new_id.clone());
+            inserted = true;
+            continue;
+        }
+        if segment_id == &target_id {
+            if !inserted {
+                new_segment_order.push(new_id.clone());
+                inserted = true;
+            }
+            continue;
+        }
+        if graph.segments.contains_key(segment_id) {
+            new_segment_order.push(segment_id.clone());
+        }
+    }
+    if !inserted {
+        new_segment_order.push(new_id.clone());
+    }
+
+    graph.segments.remove(&source_id);
+    graph.segments.remove(&target_id);
+    graph.segments.insert(
+        new_id.clone(),
+        Segment {
+            name: new_id.clone(),
+            sequence,
+            tags: Vec::new(),
+        },
+    );
+    graph.segment_order = new_segment_order;
+    graph.links = rewired_links;
+    Ok(new_id)
+}
+
+fn next_merged_id(graph: &GfaGraph, source_id: &str, target_id: &str) -> String {
+    let base = format!("{source_id}_{target_id}");
+    if !graph.segments.contains_key(&base) {
+        return base;
+    }
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{base}_merge{index}");
+        if !graph.segments.contains_key(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn replace_link_endpoint(link: &mut Link, old_id: &str, new_id: &str, new_side: char) {
+    if link.from_name == old_id {
+        link.from_name = new_id.to_string();
+        link.from_orient = orient_for_endpoint_side(new_side, "source");
+    }
+    if link.to_name == old_id {
+        link.to_name = new_id.to_string();
+        link.to_orient = orient_for_endpoint_side(new_side, "target");
+    }
+}
+
+fn orient_for_endpoint_side(side: char, role: &str) -> char {
+    match role {
+        "target" => {
+            if side == '+' {
+                '-'
+            } else {
+                '+'
+            }
+        }
+        _ => {
+            if side == '+' {
+                '+'
+            } else {
+                '-'
+            }
+        }
+    }
+}
+
+fn sorted_pair(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
+}
+
+fn other_link_node(link: &Link, node_id: &str) -> String {
+    if link.from_name == node_id {
+        return link.to_name.clone();
+    }
+    if link.to_name == node_id {
+        return link.from_name.clone();
+    }
+    node_id.to_string()
 }
 
 fn head_to_tail_sequence_feature(sequence: &str) -> String {
@@ -2257,9 +2692,111 @@ fn head_to_tail_sequence_feature(sequence: &str) -> String {
         sequence
     };
     format!(
-        "{kmer_size}\u{1f}{}\u{1f}{head}\u{1f}{tail}",
-        anchors.join("\u{1e}")
+        "{kmer_size}\u{1f}{}\u{1f}{head}\u{1f}{tail}\u{1f}{}",
+        anchors.join("\u{1e}"),
+        sha256_hex(sequence.as_bytes())
     )
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    h.iter()
+        .map(|word| format!("{word:08x}"))
+        .collect::<String>()
 }
 
 fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftError> {
@@ -2468,8 +3005,8 @@ fn score_candidates_against_references(
 ) -> Result<Vec<CandidateScore>, OrgraftError> {
     let mut scores = Vec::new();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
-        let merged = merge_graph_to_sequence(&candidate.graph)?;
-        let candidate_sequence = merged.sequence.to_ascii_uppercase();
+        let candidate_sequence =
+            gfa_editor_merge_all_sequence(&candidate.graph)?.to_ascii_uppercase();
         let mut best_for_candidate: Option<CandidateScore> = None;
         for reference in references {
             let sequence_score = score_sequence_arrangement(
@@ -2539,7 +3076,7 @@ fn score_sequence_arrangement(
     }
     let mut best = SequenceScore {
         score: 0.0,
-        method: "sequence-continuous-kmer".to_string(),
+        method: "sequence-global-kmer-chain".to_string(),
         orientation: '+',
         continuous_bp: 0,
         continuous_fraction: 0.0,
@@ -2553,7 +3090,7 @@ fn score_sequence_arrangement(
             ('+', candidate_sequence.to_string()),
             ('-', reverse_complement(candidate_sequence)),
         ] {
-            let score = continuous_kmer_score(
+            let score = global_kmer_chain_score(
                 &oriented_sequence,
                 reference_sequence,
                 &reference_index.index,
@@ -2644,7 +3181,7 @@ fn circular_kmer(sequence: &str, position: usize, kmer_size: usize) -> String {
     }
 }
 
-fn continuous_kmer_score(
+fn global_kmer_chain_score(
     candidate_sequence: &str,
     reference_sequence: &str,
     reference_index: &HashMap<String, Vec<usize>>,
@@ -2656,7 +3193,8 @@ fn continuous_kmer_score(
     let bin_size = (reference_length / 5000).max(25);
     let mut sampled = 0usize;
     let mut diagonal_bins: HashMap<usize, usize> = HashMap::new();
-    let mut positions_by_bin: HashMap<usize, Vec<usize>> = HashMap::new();
+    let reference_copies = (candidate_sequence.len() / reference_length.max(1) + 2).max(2);
+    let mut anchors = Vec::new();
 
     for query_position in (0..candidate_limit).step_by(stride) {
         let kmer = &candidate_sequence[query_position..query_position + kmer_size];
@@ -2676,83 +3214,188 @@ fn continuous_kmer_score(
                 % reference_length;
             let diagonal_bin = diagonal / bin_size;
             *diagonal_bins.entry(diagonal_bin).or_default() += 1;
-            positions_by_bin
-                .entry(diagonal_bin)
-                .or_default()
-                .push(query_position);
+            for copy_index in 0..reference_copies {
+                anchors.push((
+                    query_position,
+                    reference_position + (copy_index * reference_length),
+                    *reference_position,
+                ));
+            }
         }
     }
 
-    let best_bin = diagonal_bins
+    let (_chain_kmers, chain_bp) =
+        longest_global_kmer_chain(&anchors, kmer_size, stride, candidate_sequence.len());
+    let best_diagonal_count = diagonal_bins
         .iter()
-        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
-        .map(|(bin, _)| *bin);
-    let best_diagonal_count = best_bin
-        .and_then(|bin| diagonal_bins.get(&bin).copied())
+        .map(|(_, count)| *count)
+        .max()
         .unwrap_or(0);
-    let (continuous_bp, _continuous_kmers) = best_bin
-        .and_then(|bin| positions_by_bin.get(&bin))
-        .map(|positions| longest_continuous_kmer_chain(positions, kmer_size, stride))
-        .unwrap_or((0, 0));
     let denominator = candidate_sequence
         .len()
         .max(reference_sequence.len())
         .max(1);
-    let continuous_fraction = continuous_bp as f64 / denominator as f64;
+    let continuous_fraction = chain_bp as f64 / denominator as f64;
     let diagonal_fraction = if sampled == 0 {
         0.0
     } else {
         best_diagonal_count as f64 / sampled as f64
     };
-    let score = (0.9 * continuous_fraction) + (0.1 * diagonal_fraction);
+    let score = if sampled == 0 {
+        0.0
+    } else {
+        _chain_kmers as f64 / sampled as f64
+    };
     SequenceScore {
         score,
-        method: format!("sequence-continuous-kmer-{kmer_size}"),
+        method: format!("sequence-global-kmer-chain-{kmer_size}"),
         orientation: '+',
-        continuous_bp,
+        continuous_bp: chain_bp,
         continuous_fraction,
         diagonal_fraction,
     }
 }
 
-fn longest_continuous_kmer_chain(
-    positions: &[usize],
+#[derive(Debug, Clone)]
+struct GlobalChainState {
+    count: usize,
+    query_start: usize,
+    query_end: usize,
+    reference_start: usize,
+    reference_end: usize,
+}
+
+fn longest_global_kmer_chain(
+    anchors: &[(usize, usize, usize)],
     kmer_size: usize,
     stride: usize,
+    candidate_len: usize,
 ) -> (usize, usize) {
-    if positions.is_empty() {
+    if anchors.is_empty() {
         return (0, 0);
     }
-    let mut unique_positions = positions.to_vec();
-    unique_positions.sort_unstable();
-    unique_positions.dedup();
-    let allowed_gap = (kmer_size * 40).max(stride * 100).max(5000);
-    let mut best_bp = kmer_size;
-    let mut best_count = 1usize;
-    let mut current_start = unique_positions[0];
-    let mut current_previous = unique_positions[0];
-    let mut current_count = 1usize;
-    for position in unique_positions.into_iter().skip(1) {
-        if position - current_previous <= allowed_gap {
-            current_previous = position;
-            current_count += 1;
+    let mut sorted_anchors = anchors.to_vec();
+    sorted_anchors.sort_unstable();
+    sorted_anchors.dedup();
+    let mut reference_coordinates = sorted_anchors
+        .iter()
+        .map(|(_, reference_position, _)| *reference_position)
+        .collect::<Vec<_>>();
+    reference_coordinates.sort_unstable();
+    reference_coordinates.dedup();
+    let coordinate_rank = reference_coordinates
+        .iter()
+        .enumerate()
+        .map(|(index, coordinate)| (*coordinate, index + 1))
+        .collect::<HashMap<_, _>>();
+    let mut states: Vec<GlobalChainState> = Vec::new();
+    let mut tree: Vec<Option<usize>> = vec![None; reference_coordinates.len() + 1];
+
+    fn state_key(
+        states: &[GlobalChainState],
+        index: Option<usize>,
+        kmer_size: usize,
+    ) -> (usize, usize, usize, usize, usize) {
+        let Some(index) = index else {
+            return (0, 0, 0, 0, 0);
+        };
+        let state = &states[index];
+        (
+            state.count,
+            state.query_end - state.query_start + kmer_size,
+            state.reference_end - state.reference_start + kmer_size,
+            usize::MAX - state.query_start,
+            usize::MAX - state.reference_start,
+        )
+    }
+
+    fn better_state(
+        states: &[GlobalChainState],
+        left: Option<usize>,
+        right: Option<usize>,
+        kmer_size: usize,
+    ) -> Option<usize> {
+        if state_key(states, left, kmer_size) >= state_key(states, right, kmer_size) {
+            left
         } else {
-            let current_bp = current_previous - current_start + kmer_size;
-            if current_bp > best_bp {
-                best_bp = current_bp;
-                best_count = current_count;
-            }
-            current_start = position;
-            current_previous = position;
-            current_count = 1;
+            right
         }
     }
-    let current_bp = current_previous - current_start + kmer_size;
-    if current_bp > best_bp {
-        best_bp = current_bp;
-        best_count = current_count;
+
+    fn update_tree(
+        tree: &mut [Option<usize>],
+        states: &[GlobalChainState],
+        mut rank: usize,
+        state_index: usize,
+        kmer_size: usize,
+    ) {
+        while rank < tree.len() {
+            tree[rank] = better_state(states, Some(state_index), tree[rank], kmer_size);
+            rank += rank & rank.wrapping_neg();
+        }
     }
-    (best_bp, best_count)
+
+    fn query_tree(
+        tree: &[Option<usize>],
+        states: &[GlobalChainState],
+        mut rank: usize,
+        kmer_size: usize,
+    ) -> Option<usize> {
+        let mut best = None;
+        while rank > 0 {
+            best = better_state(states, best, tree[rank], kmer_size);
+            rank -= rank & rank.wrapping_neg();
+        }
+        best
+    }
+
+    let mut index = 0usize;
+    let mut best_state = None;
+    while index < sorted_anchors.len() {
+        let query_position = sorted_anchors[index].0;
+        let mut group_updates = Vec::new();
+        while index < sorted_anchors.len() && sorted_anchors[index].0 == query_position {
+            let (query_pos, reference_pos, _) = sorted_anchors[index];
+            let rank = coordinate_rank[&reference_pos];
+            let predecessor = query_tree(&tree, &states, rank.saturating_sub(1), kmer_size);
+            let state = if let Some(predecessor_index) = predecessor {
+                let predecessor_state = &states[predecessor_index];
+                GlobalChainState {
+                    count: predecessor_state.count + 1,
+                    query_start: predecessor_state.query_start,
+                    query_end: query_pos,
+                    reference_start: predecessor_state.reference_start,
+                    reference_end: reference_pos,
+                }
+            } else {
+                GlobalChainState {
+                    count: 1,
+                    query_start: query_pos,
+                    query_end: query_pos,
+                    reference_start: reference_pos,
+                    reference_end: reference_pos,
+                }
+            };
+            let state_index = states.len();
+            states.push(state);
+            group_updates.push((rank, state_index));
+            best_state = better_state(&states, Some(state_index), best_state, kmer_size);
+            index += 1;
+        }
+        for (rank, state_index) in group_updates {
+            update_tree(&mut tree, &states, rank, state_index, kmer_size);
+        }
+    }
+    let Some(best_index) = best_state else {
+        return (0, 0);
+    };
+    let best = &states[best_index];
+    let chain_bp = if best.count == 0 {
+        0
+    } else {
+        ((best.count - 1) * stride + kmer_size).min(candidate_len)
+    };
+    (best.count, chain_bp)
 }
 
 fn valid_dna_kmer(kmer: &str) -> bool {
@@ -3639,7 +4282,7 @@ fn write_resolve_report(
         if subgraph.candidate_count > 0 {
             writeln!(
                 out,
-                "- `{}` -> `{}`: engine `{}` selected `{}` from {} candidates; unresolved {} nodes/{} bp, resolved {} nodes/{} bp; score `{}` {} orientation `{}` length_delta {} continuous_bp {}; ready repeats `{}`; order `{}`",
+                "- `{}` -> `{}`: engine `{}` selected `{}` from {} candidates; unresolved {} nodes/{} bp, resolved {} nodes/{} bp; score `{}` {} orientation `{}` length_delta {} global_chain_bp {}; ready repeats `{}`; order `{}`",
                 subgraph.subgraph_id,
                 subgraph.reference_alias,
                 subgraph.resolution_engine,
@@ -4221,12 +4864,23 @@ fn write_resolve_details(
             &mut out,
             "resolution",
             &subgraph.subgraph_id,
+            "global_chain_bp",
+            subgraph
+                .continuous_bp
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| ".".to_string()),
+            "longest global k-mer chain span used by reference-scored repeat resolution",
+        )?;
+        write_detail(
+            &mut out,
+            "resolution",
+            &subgraph.subgraph_id,
             "continuous_bp",
             subgraph
                 .continuous_bp
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| ".".to_string()),
-            "",
+            "compatibility alias for global_chain_bp",
         )?;
         write_detail(
             &mut out,
@@ -4863,6 +5517,14 @@ mod tests {
         assert_eq!(warning, None);
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().all(|candidate| candidate.circular));
+    }
+
+    #[test]
+    fn sha256_hex_matches_standard_digest() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

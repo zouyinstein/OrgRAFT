@@ -6,7 +6,7 @@ const HELP: &str = concat!(
     "Version: ",
     env!("CARGO_PKG_VERSION"),
     "\n\n",
-    "Usage:   orgraft [--help] <command> <argument>\n\n",
+    "Usage:   orgraft [--help] [--version] <command> <argument>\n\n",
     "Commands:\n\n",
     " -- Project setup\n",
     "    setup       check external software paths and Python packages\n",
@@ -41,6 +41,10 @@ where
             print_help();
             Ok(())
         }
+        "-V" | "--version" | "version" => {
+            print_version();
+            Ok(())
+        }
         "workflow" => workflow::run(&rest),
         "recruit" => commands::recruit::run(&rest),
         "asm" => commands::asm::run(&rest),
@@ -56,6 +60,10 @@ fn print_help() {
     println!("{HELP}");
 }
 
+fn print_version() {
+    println!("orgraft {}", env!("CARGO_PKG_VERSION"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +72,14 @@ mod tests {
     fn help_command_succeeds() {
         let args = vec!["orgraft".to_string(), "--help".to_string()];
         assert!(run(args).is_ok());
+    }
+
+    #[test]
+    fn version_command_succeeds() {
+        for flag in ["--version", "-V", "version"] {
+            let args = vec!["orgraft".to_string(), flag.to_string()];
+            assert!(run(args).is_ok());
+        }
     }
 
     #[test]

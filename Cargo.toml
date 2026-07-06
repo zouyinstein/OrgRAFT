@@ -1,6 +1,6 @@
 [package]
 name = "orgraft"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Organelle Graph Read-backed Assembly and FASTA Traceability"
 license = "MIT"
