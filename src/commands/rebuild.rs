@@ -208,11 +208,12 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
     let raw_stats = graph_stats(&raw_gfa);
     let merged_stats = graph_stats(&merged_gfa);
     let verified_stats = graph_stats(&verified_gfa);
-    let status = if consistency.unmapped_segments == 0 {
-        "PASS"
-    } else {
-        "WARN"
-    };
+    let status =
+        if consistency.unmapped_segments == 0 && consistency.linear_tiling_status() == "PASS" {
+            "PASS"
+        } else {
+            "WARN"
+        };
     let summary = vec![
         ("status", status.to_string()),
         ("organelle", options.organelle.clone()),
@@ -241,6 +242,15 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
         ),
         ("polished_length", consistency.polished_length.to_string()),
         ("covered_bases", consistency.covered_bases.to_string()),
+        ("gap_bases", consistency.gap_bases.to_string()),
+        (
+            "multi_covered_bases",
+            consistency.multi_covered_bases.to_string(),
+        ),
+        (
+            "linear_tiling",
+            consistency.linear_tiling_status().to_string(),
+        ),
         (
             "coverage_fraction",
             format!("{:.6}", consistency.coverage_fraction),
@@ -2774,8 +2784,12 @@ fn write_result_stats(
     )?;
     writeln!(
         out,
-        "consistency\t{subgraph}\tcoverage\tcovered_bases\t{}\tmulti_covered_bases={};coverage_fraction={:.6}",
-        consistency.covered_bases, consistency.multi_covered_bases, consistency.coverage_fraction
+        "consistency\t{subgraph}\tcoverage\tcovered_bases\t{}\tmulti_covered_bases={};gap_bases={};coverage_fraction={:.6};linear_tiling={}",
+        consistency.covered_bases,
+        consistency.multi_covered_bases,
+        consistency.gap_bases,
+        consistency.coverage_fraction,
+        consistency.linear_tiling_status()
     )?;
     writeln!(
         out,
@@ -3149,6 +3163,7 @@ struct CoordinateConsistency {
     unmapped_segments: usize,
     covered_bases: usize,
     multi_covered_bases: usize,
+    gap_bases: usize,
     coverage_fraction: f64,
     raw_segments: usize,
     merged_segments: usize,
@@ -3167,17 +3182,26 @@ impl CoordinateConsistency {
         let mut mapped = 0usize;
         let mut unmapped = 0usize;
         for name in &merged.order {
-            if let Some(hit) = mapping.by_node[name].selected.as_ref() {
+            let node_mapping = &mapping.by_node[name];
+            let hits = if node_mapping.accepted_hits.is_empty() {
+                node_mapping.selected.iter().collect::<Vec<_>>()
+            } else {
+                node_mapping.accepted_hits.iter().collect::<Vec<_>>()
+            };
+            if hits.is_empty() {
+                unmapped += 1;
+            } else {
                 mapped += 1;
+            }
+            for hit in hits {
                 for pos in hit.target_start..hit.target_end {
                     coverage[pos % record.sequence.len()] += 1;
                 }
-            } else {
-                unmapped += 1;
             }
         }
         let covered = coverage.iter().filter(|value| **value > 0).count();
         let multi = coverage.iter().filter(|value| **value > 1).count();
+        let gap_bases = record.sequence.len().saturating_sub(covered);
         Self {
             polished_length: record.sequence.len(),
             polished_hash64: stable_hash64(&record.sequence),
@@ -3185,10 +3209,19 @@ impl CoordinateConsistency {
             unmapped_segments: unmapped,
             covered_bases: covered,
             multi_covered_bases: multi,
+            gap_bases,
             coverage_fraction: covered as f64 / record.sequence.len() as f64,
             raw_segments: raw.order.len(),
             merged_segments: merged.order.len(),
             verified_segments: verified.order.len(),
+        }
+    }
+
+    fn linear_tiling_status(&self) -> &'static str {
+        if self.gap_bases == 0 && self.multi_covered_bases == 0 {
+            "PASS"
+        } else {
+            "WARN"
         }
     }
 }
@@ -3738,6 +3771,65 @@ mod tests {
     }
 
     #[test]
+    fn consistency_uses_all_accepted_node_copies_for_linear_tiling() {
+        let record = test_record("ACGTACGTAA");
+        let gfa = test_gfa(&[("repeat", "AC"), ("single", "GTGTAA")]);
+        let mut by_node = BTreeMap::new();
+        let repeat_hits = vec![
+            make_synthetic_hit("repeat", 2, 1, 2, 1, 2, '+'),
+            make_synthetic_hit("repeat", 2, 1, 2, 5, 6, '+'),
+        ];
+        let single_hits = vec![
+            make_synthetic_hit("single", 6, 1, 2, 3, 4, '+'),
+            make_synthetic_hit("single", 6, 3, 6, 7, 10, '+'),
+        ];
+        by_node.insert("repeat".to_string(), test_mapping(repeat_hits));
+        by_node.insert("single".to_string(), test_mapping(single_hits));
+        let mapping = Mapping {
+            by_node,
+            reference_len: record.sequence.len(),
+            command: String::new(),
+            stderr: String::new(),
+        };
+
+        let consistency = CoordinateConsistency::new(&record, &gfa, &gfa, &gfa, &mapping);
+
+        assert_eq!(consistency.covered_bases, 10);
+        assert_eq!(consistency.gap_bases, 0);
+        assert_eq!(consistency.multi_covered_bases, 0);
+        assert_eq!(consistency.linear_tiling_status(), "PASS");
+        assert_eq!(consistency.coverage_fraction, 1.0);
+    }
+
+    #[test]
+    fn consistency_reports_gaps_and_overlaps() {
+        let record = test_record("ACGTAC");
+        let gfa = test_gfa(&[("left", "ACG"), ("right", "GT")]);
+        let mut by_node = BTreeMap::new();
+        by_node.insert(
+            "left".to_string(),
+            test_mapping(vec![make_synthetic_hit("left", 3, 1, 3, 1, 3, '+')]),
+        );
+        by_node.insert(
+            "right".to_string(),
+            test_mapping(vec![make_synthetic_hit("right", 2, 1, 2, 3, 4, '+')]),
+        );
+        let mapping = Mapping {
+            by_node,
+            reference_len: record.sequence.len(),
+            command: String::new(),
+            stderr: String::new(),
+        };
+
+        let consistency = CoordinateConsistency::new(&record, &gfa, &gfa, &gfa, &mapping);
+
+        assert_eq!(consistency.covered_bases, 4);
+        assert_eq!(consistency.gap_bases, 2);
+        assert_eq!(consistency.multi_covered_bases, 1);
+        assert_eq!(consistency.linear_tiling_status(), "WARN");
+    }
+
+    #[test]
     fn output_paths_use_subgraph_id() {
         let paths = OutputPaths::new(Path::new("out"), "subgraph_007");
         assert_eq!(
@@ -3767,5 +3859,44 @@ mod tests {
         assert!(parse_subgraph_id("../subgraph_001").is_err());
         assert!(parse_subgraph_id("subgraph/001").is_err());
         assert!(parse_subgraph_id("subgraph_001").is_ok());
+    }
+
+    fn test_record(sequence: &str) -> FastaRecord {
+        FastaRecord {
+            header: "test".to_string(),
+            id: "test".to_string(),
+            sequence: sequence.to_string(),
+        }
+    }
+
+    fn test_gfa(nodes: &[(&str, &str)]) -> Gfa {
+        let mut segments = BTreeMap::new();
+        let mut order = Vec::new();
+        for (name, sequence) in nodes {
+            order.push((*name).to_string());
+            segments.insert(
+                (*name).to_string(),
+                Segment {
+                    name: (*name).to_string(),
+                    sequence: (*sequence).to_string(),
+                    tags: Vec::new(),
+                },
+            );
+        }
+        Gfa {
+            headers: Vec::new(),
+            segments,
+            order,
+            links: Vec::new(),
+            other_lines: Vec::new(),
+        }
+    }
+
+    fn test_mapping(hits: Vec<PafHit>) -> NodeMapping {
+        NodeMapping {
+            selected: hits.first().cloned(),
+            accepted_hits: hits.clone(),
+            all_hits: hits,
+        }
     }
 }
