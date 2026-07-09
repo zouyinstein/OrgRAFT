@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::commands::asm_core;
-use crate::commands::shared::{print_contract, CommandContract};
+use crate::commands::shared::{
+    print_contract, resolve_gfa_editor_cli, run_gfa_editor_image, CommandContract, GfaImageExport,
+};
 use crate::error::OrgraftError;
 
 // Command shell for `orgraft asm`: parse user-facing options, prepare the
@@ -32,6 +34,8 @@ Additional Parameters:
   --profile NAME            low | standard | high [standard]
   --profile-help            show profile presets and advanced assembly parameters
   --threads N               threads passed to the assembly core [8]
+  --image-reference-fasta FILE
+                            reference FASTA for graph colouring; exports graph.pdf/svg
 
 Layout: OUT/ORGANELLE/{01.input_reads,02.anchor_graph_core,03.finalize_graph,logs}
 
@@ -81,6 +85,7 @@ Advanced parameters:
   --min-link-ratio FLOAT    optional weak-link ratio filter
   --subsets LIST            manual read subset percent(s) for high-depth reruns
   --finalize-dedup-rc-links on|off  deduplicate RC L records in finalize graph [on]
+  --image-reference-fasta FILE       export graph.pdf/svg from finalize graph
   --keep-debug-files        keep .full.* graph companions and subset FASTA files
 "#;
 
@@ -150,6 +155,11 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
     write_algorithm_notes(&logs_dir.join("algorithm.md"))?;
 
     let source_reads = canonicalize_existing(&input.reads)?;
+    let image_reference_fasta = options
+        .image_reference_fasta
+        .as_ref()
+        .map(|path| canonicalize_existing(path))
+        .transpose()?;
     let reads_for_command = prepare_input_link(&source_reads, &input_step)?;
     write_input_manifest(
         &input_step.join("manifest.tsv"),
@@ -207,12 +217,31 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
         &output_gfa,
         options.finalize_dedup_rc_links,
     )?;
+    let image_exports = export_finalize_graph_images(
+        &output_gfa,
+        &finalize_step,
+        image_reference_fasta.as_deref(),
+        &options.soft_paths,
+    );
+    for row in image_exports.iter().filter(|row| row.status != "written") {
+        if image_reference_fasta.is_some() {
+            eprintln!(
+                "Warning: optional GFA_Editor {} export {} for {}; see {}",
+                row.format,
+                row.status,
+                row.output.display(),
+                finalize_step.join("manifest.tsv").display()
+            );
+        }
+    }
     write_finalize_manifest(
         &finalize_step.join("manifest.tsv"),
         &selected_graph,
         &output_gfa,
         finalize_stats,
         options.finalize_dedup_rc_links,
+        image_reference_fasta.as_deref(),
+        &image_exports,
     )?;
 
     let summary = RunSummary {
@@ -243,12 +272,15 @@ fn contract() -> CommandContract {
             "results/draft_asm/<organelle>/01.input_reads",
             "results/draft_asm/<organelle>/02.anchor_graph_core",
             "results/draft_asm/<organelle>/03.finalize_graph/graph.gfa",
+            "optional results/draft_asm/<organelle>/03.finalize_graph/graph.pdf",
+            "optional results/draft_asm/<organelle>/03.finalize_graph/graph.svg",
             "results/draft_asm/<organelle>/logs/*.log",
         ],
         notes: &[
             "OrgRAFT runs one explicit profile for one recruited read input",
             "mito defaults to the standard skeleton-link workflow",
             "plastid defaults to the standard direct-anchor workflow",
+            "graph PDF/SVG export runs only when --image-reference-fasta is provided",
             "polishing is intentionally not part of this draft assembly command",
         ],
     }
@@ -268,6 +300,7 @@ struct AsmOptions {
     min_link_ratio: Option<f64>,
     read_subsets: Option<Vec<u16>>,
     finalize_dedup_rc_links: bool,
+    image_reference_fasta: Option<PathBuf>,
     keep_debug_files: bool,
 }
 
@@ -284,6 +317,7 @@ impl AsmOptions {
         let mut min_link_ratio = None;
         let mut read_subsets = None;
         let mut finalize_dedup_rc_links = true;
+        let mut image_reference_fasta = None;
         let mut keep_debug_files = false;
         let mut stable = false;
         let mut profile = AsmProfile::Standard;
@@ -395,6 +429,13 @@ impl AsmOptions {
                         "--finalize-dedup-rc-links",
                     )?;
                 }
+                "--image-reference-fasta" => {
+                    image_reference_fasta = Some(PathBuf::from(value_after(
+                        args,
+                        &mut index,
+                        "--image-reference-fasta",
+                    )?));
+                }
                 "--stable" => stable = true,
                 "--keep-debug-files" => keep_debug_files = true,
                 "--force" => force = true,
@@ -440,6 +481,7 @@ impl AsmOptions {
             min_link_ratio,
             read_subsets,
             finalize_dedup_rc_links,
+            image_reference_fasta,
             keep_debug_files,
         })
     }
@@ -789,6 +831,57 @@ fn copy_finalize_graph(
     Ok(stats)
 }
 
+fn export_finalize_graph_images(
+    output_gfa: &Path,
+    finalize_step: &Path,
+    image_reference_fasta: Option<&Path>,
+    soft_paths: &HashMap<String, PathBuf>,
+) -> Vec<GfaImageExport> {
+    let outputs = [
+        ("pdf", finalize_step.join("graph.pdf")),
+        ("svg", finalize_step.join("graph.svg")),
+    ];
+    let Some(image_reference_fasta) = image_reference_fasta else {
+        return skipped_finalize_graph_images(&outputs, "skipped_no_image_reference");
+    };
+    let gfa_editor_cli = match resolve_gfa_editor_cli(soft_paths) {
+        Ok(path) => path,
+        Err(error) => return skipped_finalize_graph_images(&outputs, &error),
+    };
+    outputs
+        .iter()
+        .map(|(format, output_path)| {
+            run_gfa_editor_image(
+                &gfa_editor_cli,
+                soft_paths,
+                output_gfa,
+                output_path,
+                image_reference_fasta,
+                format,
+            )
+        })
+        .collect()
+}
+
+fn skipped_finalize_graph_images(outputs: &[(&str, PathBuf)], reason: &str) -> Vec<GfaImageExport> {
+    let status = if reason == "skipped_no_image_reference" {
+        "skipped_no_image_reference"
+    } else {
+        "skipped_missing_gfa_editor_cli"
+    };
+    outputs
+        .iter()
+        .map(|(format, output_path)| GfaImageExport {
+            format: (*format).to_string(),
+            output: output_path.clone(),
+            command: ".".to_string(),
+            status: status.to_string(),
+            stdout: String::new(),
+            stderr: reason.to_string(),
+        })
+        .collect()
+}
+
 fn canonical_finalize_link_key(
     line: &str,
     line_number: usize,
@@ -841,6 +934,8 @@ fn write_finalize_manifest(
     output_gfa: &Path,
     stats: FinalizeGraphStats,
     dedup_rc_links: bool,
+    image_reference_fasta: Option<&Path>,
+    image_exports: &[GfaImageExport],
 ) -> Result<(), OrgraftError> {
     let mut out = File::create(path)?;
     writeln!(out, "key\tvalue")?;
@@ -858,6 +953,35 @@ fn write_finalize_manifest(
         "rc_duplicate_links_removed\t{}",
         stats.rc_duplicate_links_removed
     )?;
+    writeln!(
+        out,
+        "image_reference_fasta\t{}",
+        image_reference_fasta
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    )?;
+    for row in image_exports {
+        writeln!(out, "image_{}_output\t{}", row.format, row.output.display())?;
+        writeln!(out, "image_{}_status\t{}", row.format, row.status)?;
+        writeln!(
+            out,
+            "image_{}_command\t{}",
+            row.format,
+            row.command.replace('\n', "\\n")
+        )?;
+        writeln!(
+            out,
+            "image_{}_stdout\t{}",
+            row.format,
+            row.stdout.replace('\n', "\\n")
+        )?;
+        writeln!(
+            out,
+            "image_{}_stderr\t{}",
+            row.format,
+            row.stderr.replace('\n', "\\n")
+        )?;
+    }
     Ok(())
 }
 
@@ -1280,6 +1404,7 @@ mod tests {
         assert!(PROFILE_HELP.contains("Workflow frame:"));
         assert!(PROFILE_HELP.contains("03.finalize_graph publishes the selected graph"));
         assert!(PROFILE_HELP.contains("--finalize-dedup-rc-links on|off"));
+        assert!(PROFILE_HELP.contains("--image-reference-fasta FILE"));
         assert!(PROFILE_HELP.contains("--stable                  for unstable mitogenomes"));
         assert!(PROFILE_HELP.contains("--keep-debug-files"));
     }
@@ -1379,6 +1504,7 @@ mod tests {
         assert_eq!(options.input.profile, AsmProfile::Standard);
         assert_eq!(options.threads, DEFAULT_THREADS);
         assert!(options.finalize_dedup_rc_links);
+        assert_eq!(options.image_reference_fasta, None);
     }
 
     #[test]
@@ -1443,6 +1569,24 @@ mod tests {
         .unwrap();
 
         assert!(options.keep_debug_files);
+    }
+
+    #[test]
+    fn parses_image_reference_fasta() {
+        let options = AsmOptions::from_args(&[
+            "--reads".to_string(),
+            "mito.fastq.gz".to_string(),
+            "--organelle".to_string(),
+            "mito".to_string(),
+            "--image-reference-fasta".to_string(),
+            "refs/mito.fa".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.image_reference_fasta,
+            Some(PathBuf::from("refs/mito.fa"))
+        );
     }
 
     #[test]

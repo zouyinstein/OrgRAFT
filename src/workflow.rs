@@ -173,6 +173,7 @@ struct WorkflowAsmConfig {
     min_link_support: Option<u32>,
     min_link_ratio: Option<f64>,
     subsets: Option<String>,
+    image_reference_fasta: Option<PathBuf>,
     keep_debug_files: bool,
     extra_args: Vec<String>,
 }
@@ -379,6 +380,7 @@ threads = 8
 # min_link_support = 20
 # min_link_ratio = 0.05
 # subsets = "3,5,10"
+# image_reference_fasta = "/path/to/reference.fasta"  # workflow default: matching case reference/bait
 # keep_debug_files = true
 
 [commands.resolve]
@@ -726,6 +728,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
             min_link_support: None,
             min_link_ratio: None,
             subsets: None,
+            image_reference_fasta: None,
             keep_debug_files: false,
             extra_args: Vec::new(),
         },
@@ -1604,6 +1607,18 @@ fn asm_threads(config: &WorkflowConfig) -> usize {
     config.asm.threads.unwrap_or(config.threads)
 }
 
+fn asm_image_reference_fasta<'a>(
+    config: &'a WorkflowConfig,
+    case: &'a WorkflowCase,
+) -> Option<&'a Path> {
+    config
+        .asm
+        .image_reference_fasta
+        .as_deref()
+        .or(case.reference.as_deref())
+        .or(case.pre_rotated_reference.as_deref())
+}
+
 fn polish_threads(config: &WorkflowConfig) -> usize {
     config.polish.threads.unwrap_or(config.threads)
 }
@@ -1720,6 +1735,11 @@ fn asm_args(config: &WorkflowConfig, case: &WorkflowCase) -> Vec<String> {
     push_raw_display_option(&mut args, "--link-support", asm.min_link_support);
     push_raw_display_option(&mut args, "--min-link-ratio", asm.min_link_ratio);
     push_raw_string_option(&mut args, "--subsets", asm.subsets.as_deref());
+    push_raw_path_option(
+        &mut args,
+        "--image-reference-fasta",
+        asm_image_reference_fasta(config, case),
+    );
     push_raw_flag(&mut args, "--keep-debug-files", asm.keep_debug_files);
     push_raw_flag(&mut args, "--force", config.force);
     args.extend(asm.extra_args.iter().cloned());
@@ -1900,6 +1920,11 @@ fn asm_command(config: &WorkflowConfig, case: &WorkflowCase) -> String {
     push_display_option(&mut args, "--link-support", asm.min_link_support);
     push_display_option(&mut args, "--min-link-ratio", asm.min_link_ratio);
     push_string_option(&mut args, "--subsets", asm.subsets.as_deref());
+    push_path_option(
+        &mut args,
+        "--image-reference-fasta",
+        asm_image_reference_fasta(config, case),
+    );
     push_flag(&mut args, "--keep-debug-files", asm.keep_debug_files);
     push_flag(&mut args, "--force", config.force);
     args.extend(asm.extra_args.iter().cloned());
@@ -2547,6 +2572,11 @@ impl WorkflowAsmConfig {
             min_link_support: parse_optional_u32(&section, "min_link_support")?,
             min_link_ratio: parse_optional_f64(&section, "min_link_ratio")?,
             subsets: section.get("subsets").cloned(),
+            image_reference_fasta: optional_expanded_path(
+                &section,
+                "image_reference_fasta",
+                &expand,
+            ),
             keep_debug_files: parse_section_bool(&section, "keep_debug_files", false)?,
             extra_args: split_extra_args(section.get("extra_args")),
         })
@@ -4570,6 +4600,7 @@ reference = "mito.fa"
         assert!(script.contains("# 05.rebuild:"));
         assert!(script.contains("\"${ORGRAFT_BIN}\" recruit"));
         assert!(script.contains("\"${ORGRAFT_BIN}\" asm"));
+        assert!(script.contains("--image-reference-fasta mito.fa"));
         assert!(script.contains("\"${ORGRAFT_BIN}\" resolve"));
         assert!(script.contains("\"${ORGRAFT_BIN}\" polish"));
         assert!(script.contains("--gfa-editor-mode cli"));
@@ -4685,9 +4716,11 @@ reference = "plastid.fa"
         assert!(!mito_script.contains("\"${ORGRAFT_BIN}\" recruit"));
         assert!(mito_script.contains("recruit handled once by the master workflow script"));
         assert!(mito_script.contains("\"${ORGRAFT_BIN}\" asm --reads"));
+        assert!(mito_script.contains("--image-reference-fasta mito.fa"));
         assert!(!plastid_script.contains("\"${ORGRAFT_BIN}\" recruit"));
         assert!(plastid_script.contains("recruit handled once by the master workflow script"));
         assert!(plastid_script.contains("\"${ORGRAFT_BIN}\" asm --reads"));
+        assert!(plastid_script.contains("--image-reference-fasta plastid.fa"));
         assert!(mito_script.contains("--organelle mito"));
         assert!(plastid_script.contains("--organelle plastid"));
         assert!(config.cases[0]

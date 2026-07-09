@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::commands::shared::{print_contract, CommandContract};
+use crate::commands::shared::{
+    print_contract, resolve_gfa_editor_cli, run_gfa_editor_image, CommandContract, GfaImageExport,
+};
 use crate::error::OrgraftError;
 
 const HELP: &str = r#"orgraft rebuild
@@ -2445,16 +2447,6 @@ fn parse_sortable_usize(value: &str) -> usize {
     value.parse::<usize>().unwrap_or(usize::MAX)
 }
 
-#[derive(Debug, Clone)]
-struct GfaImageExport {
-    format: String,
-    output: PathBuf,
-    command: String,
-    status: String,
-    stdout: String,
-    stderr: String,
-}
-
 fn export_gfa_reference_images(
     paths: &OutputPaths,
     image_reference_fasta: &Path,
@@ -2493,90 +2485,6 @@ fn skipped_gfa_reference_images(paths: &OutputPaths, reason: &str) -> Vec<GfaIma
         stderr: reason.to_string(),
     })
     .collect()
-}
-
-fn run_gfa_editor_image(
-    gfa_editor_cli: &Path,
-    soft_paths: &HashMap<String, PathBuf>,
-    input_gfa: &Path,
-    output_path: &Path,
-    image_reference_fasta: &Path,
-    format: &str,
-) -> GfaImageExport {
-    let mut command = command_for_python_script(gfa_editor_cli, soft_paths);
-    command.extend([
-        "image".to_string(),
-        input_gfa.display().to_string(),
-        output_path.display().to_string(),
-        "--colour".to_string(),
-        "blastsolid".to_string(),
-        "--query".to_string(),
-        image_reference_fasta.display().to_string(),
-        "--alignment-tool".to_string(),
-        "minimap2".to_string(),
-        "--layout".to_string(),
-        "bandage".to_string(),
-        "--target-role".to_string(),
-        "subject".to_string(),
-        "--alignment-args".to_string(),
-        "-x asm5 -c --secondary=yes".to_string(),
-    ]);
-    let command_text = command.join(" ");
-    let Some((program, args)) = command.split_first() else {
-        return GfaImageExport {
-            format: format.to_string(),
-            output: output_path.to_path_buf(),
-            command: command_text,
-            status: "failed".to_string(),
-            stdout: String::new(),
-            stderr: "empty GFA_Editor command".to_string(),
-        };
-    };
-    let output = match Command::new(program).args(args).output() {
-        Ok(output) => output,
-        Err(error) => {
-            return GfaImageExport {
-                format: format.to_string(),
-                output: output_path.to_path_buf(),
-                command: command_text,
-                status: "failed_to_run".to_string(),
-                stdout: String::new(),
-                stderr: format!("failed to run GFA_Editor image export: {error}"),
-            };
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let status = if output.status.success() {
-        "written"
-    } else {
-        "failed"
-    };
-    GfaImageExport {
-        format: format.to_string(),
-        output: output_path.to_path_buf(),
-        command: command_text,
-        status: status.to_string(),
-        stdout,
-        stderr,
-    }
-}
-
-fn command_for_python_script(path: &Path, soft_paths: &HashMap<String, PathBuf>) -> Vec<String> {
-    let path_text = path.display().to_string();
-    if path.extension().and_then(|value| value.to_str()) == Some("py") {
-        if let Some(parent) = path.parent().and_then(Path::parent) {
-            let local_python = parent.join(".venv/bin/python");
-            if local_python.exists() {
-                return vec![local_python.display().to_string(), path_text];
-            }
-        }
-        if let Some(python) = soft_paths.get("python") {
-            return vec![python.display().to_string(), path_text];
-        }
-        return vec!["python3".to_string(), path_text];
-    }
-    vec![path_text]
 }
 
 fn write_run_report(
@@ -3507,15 +3415,6 @@ fn read_soft_paths(path: &Path) -> Result<HashMap<String, PathBuf>, OrgraftError
         }
     }
     Ok(map)
-}
-
-fn resolve_gfa_editor_cli(soft_paths: &HashMap<String, PathBuf>) -> Result<PathBuf, OrgraftError> {
-    if let Some(path) = soft_paths.get("gfa_editor_cli") {
-        return Ok(path.clone());
-    }
-    Err(OrgraftError::InvalidArgument(
-        "missing gfa_editor_cli in soft paths for optional image export".to_string(),
-    ))
 }
 
 fn discover_validate_data_dir(polished_fasta: &Path) -> Option<PathBuf> {
