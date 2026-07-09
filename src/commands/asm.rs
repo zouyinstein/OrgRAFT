@@ -34,8 +34,7 @@ Additional Parameters:
   --profile NAME            low | standard | high [standard]
   --profile-help            show profile presets and advanced assembly parameters
   --threads N               threads passed to the assembly core [8]
-  --image-reference-fasta FILE
-                            reference FASTA for graph colouring; exports graph.pdf/svg
+  --image-reference-fasta FILE  reference FASTA; exports graph.pdf/svg
 
 Layout: OUT/ORGANELLE/{01.input_reads,02.anchor_graph_core,03.finalize_graph,logs}
 
