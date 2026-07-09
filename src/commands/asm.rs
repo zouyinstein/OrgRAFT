@@ -22,18 +22,18 @@ Usage:
   orgraft asm --reads FILE --organelle mito|plastid [options]
 
 Inputs:
-  --reads FILE              recruited organelle reads
-  --organelle NAME          mito or plastid
-  --soft-paths FILE         software path table for minimap2 [soft_paths.txt]
+  --reads FILE                  recruited organelle reads
+  --organelle NAME              mito or plastid
+  --soft-paths FILE             software path table for minimap2 [soft_paths.txt]
 
 Outputs:
-  --out-dir DIR             draft assembly directory [results/draft_asm]
-  --force                   replace existing step outputs for this organelle
+  --out-dir DIR                 draft assembly directory [results/draft_asm]
+  --force                       replace existing step outputs for this organelle
 
 Additional Parameters:
-  --profile NAME            low | standard | high [standard]
-  --profile-help            show profile presets and advanced assembly parameters
-  --threads N               threads passed to the assembly core [8]
+  --profile NAME                low | standard | high [standard]
+  --profile-help                show profile presets and advanced assembly parameters
+  --threads N                   threads passed to the assembly core [8]
   --image-reference-fasta FILE  reference FASTA; exports graph.pdf/svg
 
 Layout: OUT/ORGANELLE/{01.input_reads,02.anchor_graph_core,03.finalize_graph,logs}
@@ -1386,7 +1386,9 @@ mod tests {
     #[test]
     fn main_help_points_to_profile_help() {
         assert!(HELP.contains("--profile-help"));
-        assert!(HELP.contains("--threads N               threads passed to the assembly core [8]"));
+        assert!(
+            HELP.contains("--threads N                   threads passed to the assembly core [8]")
+        );
         assert!(HELP.contains("Outputs:"));
         assert!(HELP.contains(
             "Layout: OUT/ORGANELLE/{01.input_reads,02.anchor_graph_core,03.finalize_graph,logs}"
