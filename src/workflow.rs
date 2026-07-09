@@ -4043,6 +4043,7 @@ fn polish_round_dir(case: &WorkflowCase, round: usize) -> PathBuf {
     polish_run_out_dir(case, round)
         .join(&case.organelle)
         .join(&case.subgraph)
+        .join(format!("round_{round}"))
 }
 
 fn polish_run_out_dir(case: &WorkflowCase, _round: usize) -> PathBuf {
@@ -4050,33 +4051,25 @@ fn polish_run_out_dir(case: &WorkflowCase, _round: usize) -> PathBuf {
 }
 
 fn sv_summary_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    polish_round_dir(case, round).join(format!(
-        "03.validate/round_{round}/03.reports/sv_snv_indel_summary.tsv"
-    ))
+    polish_round_dir(case, round).join("03.validate/03.reports/sv_snv_indel_summary.tsv")
 }
 
 fn snv_indel_high_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    polish_round_dir(case, round).join(format!(
-        "03.validate/round_{round}/03.reports/snv_indel_high.tsv"
-    ))
+    polish_round_dir(case, round).join("03.validate/03.reports/snv_indel_high.tsv")
 }
 
 fn polished_aln_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    let polish_dir = polish_round_dir(case, round).join("02.polish");
     if round == 1 {
-        polish_dir.join("polished_aln.fasta")
+        polish_round_dir(case, round).join("02.polish/polished_aln.fasta")
     } else {
-        polish_dir.join(format!("polished_aln.round_{round}.fasta"))
+        polish_round_dir(case, round)
+            .join("01.inputs")
+            .join(format!("linear_subgraph.round_{round}.fasta"))
     }
 }
 
 fn polish_report_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    let logs_dir = polish_round_dir(case, round).join("logs");
-    if round == 1 {
-        logs_dir.join("report.tsv")
-    } else {
-        logs_dir.join(format!("report.round_{round}.tsv"))
-    }
+    polish_round_dir(case, round).join("logs/report.tsv")
 }
 
 fn corrected_fasta_path(case: &WorkflowCase, round: usize) -> PathBuf {
@@ -4466,6 +4459,7 @@ reference = "mito.fa"
                 .join("04.polish")
                 .join("mito")
                 .join("subgraph_001")
+                .join("round_1")
         );
         assert_eq!(
             polish_round_dir(case, 2),
@@ -4473,6 +4467,7 @@ reference = "mito.fa"
                 .join("04.polish")
                 .join("mito")
                 .join("subgraph_001")
+                .join("round_2")
         );
         assert_eq!(
             sv_summary_path(case, 2),
@@ -4480,8 +4475,8 @@ reference = "mito.fa"
                 .join("04.polish")
                 .join("mito")
                 .join("subgraph_001")
-                .join("03.validate")
                 .join("round_2")
+                .join("03.validate")
                 .join("03.reports")
                 .join("sv_snv_indel_summary.tsv")
         );
@@ -4491,8 +4486,9 @@ reference = "mito.fa"
                 .join("04.polish")
                 .join("mito")
                 .join("subgraph_001")
-                .join("02.polish")
-                .join("polished_aln.round_2.fasta")
+                .join("round_2")
+                .join("01.inputs")
+                .join("linear_subgraph.round_2.fasta")
         );
         let script_path = dir.join("workflow.commands.sh");
         write_plan_script(&script_path, &config, case, None, false, true).unwrap();

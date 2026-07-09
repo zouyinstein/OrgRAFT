@@ -58,7 +58,7 @@ Workflow-generated roots are numbered for the major products:
 | `asm` | `ORGANELLE/03.finalize_graph/graph.gfa`, optional `graph.edited.gfa`, `ORGANELLE/logs/*.tsv` | The finalize graph removes reverse-complement duplicate `L` records by default while preserving intermediate evidence |
 | `workflow checkpoint1` | `checkpoint_1.status.tsv`, `checked_draft.gfa`, optional `manual_edit_required.gfa` | Topology and GFA consistency gate before resolve |
 | `resolve` | `ORGANELLE/graph/merged_unresolved.gfa`, `merged_unresolved_subgraph_001.gfa`, `ORGANELLE/fasta/rotated_reference.fasta`, `resolved_subgraphs.fasta`, `logs/resolve_details.tsv` | Uses checked draft graph plus reference FASTA |
-| `polish` | `ORGANELLE/SUBGRAPH/02.polish/polished_aln[.round_N].fasta`, `03.validate/round_N/01.data/*.tsv`, `03.validate/round_N/02.plots/*.png`, `logs/report[.round_N].tsv` | Plot scripts require `matplotlib` |
+| `polish` | `ORGANELLE/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}`; round 2+ leaves `02.polish` empty and validates `01.inputs/linear_subgraph.round_N.fasta` | Plot scripts require `matplotlib` |
 | `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | SV failures stop for manual review; SNV/InDel correction can continue up to `max_rounds` |
 | `rebuild` | `OUT/SUBGRAPH/rebuild_SUBGRAPH.gfa`, `rebuild_SUBGRAPH.fasta`, `rebuild_SUBGRAPH_nodes.fasta`, `OUT/logs/*.tsv` | PDF/SVG export is attempted only when an image reference is supplied |
 

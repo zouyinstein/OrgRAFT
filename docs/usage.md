@@ -210,12 +210,16 @@ results_workflow/
   03.resolve_gfa/
   04.polish/
     mito/subgraph_001/
-      02.polish/
-        polished_aln.fasta
-        polished_aln.round_2.fasta
-      03.validate/
-        round_1/
-        round_2/
+      round_1/
+        01.inputs/
+        02.polish/
+          polished_aln.fasta
+        03.validate/
+      round_2/
+        01.inputs/
+          linear_subgraph.round_2.fasta
+        02.polish/
+        03.validate/
   05.rebuild/
   workflow/
     mito/subgraph_001/

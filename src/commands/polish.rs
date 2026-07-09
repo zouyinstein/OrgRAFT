@@ -39,7 +39,7 @@ Additional Parameters:
   --snv-indel-overlap-policy MODE         mark-overlap|mask-both|assign-downstream [mark-overlap]
   --plot-help                             show advanced plot tuning options
 
-Layout: OUT/NAME/SUBGRAPH/{01.inputs,02.polish,03.validate}
+Layout: OUT/NAME/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}
 "#;
 
 const PLOT_HELP: &str = r#"orgraft polish plot parameters
@@ -64,7 +64,7 @@ SNV/InDel:
   --snv-indel-plot-low-min-fraction FLOAT grey SNV/InDel points below this frequency [0]
   --snv-indel-plot-high-risk-fraction F   orange/red highlight threshold for SNV/InDel points [0.5]
 
-Generated scripts in 03.validate/round_N/02.plots also provide their own --help for replotting.
+Generated scripts in round_N/03.validate/02.plots also provide their own --help for replotting.
 "#;
 
 const DEFAULT_SUBGRAPH: &str = "subgraph_001";
@@ -204,25 +204,14 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
         options.validate_round,
     );
 
-    if paths.subgraph_dir.exists() {
-        if options.validate_round == 1 {
-            if options.force {
-                fs::remove_dir_all(&paths.subgraph_dir)?;
-            } else {
-                return Err(OrgraftError::InvalidArgument(format!(
-                    "{} already exists; use --force to replace this subgraph workspace",
-                    paths.subgraph_dir.display()
-                )));
-            }
-        } else if paths.round1_dir.exists() {
-            if options.force {
-                fs::remove_dir_all(&paths.round1_dir)?;
-            } else {
-                return Err(OrgraftError::InvalidArgument(format!(
-                    "{} already exists; use --force to replace this validation round",
-                    paths.round1_dir.display()
-                )));
-            }
+    if paths.round_dir.exists() {
+        if options.force {
+            fs::remove_dir_all(&paths.round_dir)?;
+        } else {
+            return Err(OrgraftError::InvalidArgument(format!(
+                "{} already exists; use --force to replace this workflow round workspace",
+                paths.round_dir.display()
+            )));
         }
     }
 
@@ -247,15 +236,51 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
     let prepare_seconds = started.elapsed().as_secs_f64();
 
     let mut command_records = Vec::new();
+    let validation_round = format!("round_{}", options.validate_round);
+    let mut stage_records = vec![StageRecord::ok(
+        "prepare",
+        "setup",
+        prepare_seconds,
+        "polish workspace initialized",
+    )];
 
-    let polish_started = Instant::now();
-    let round_reports = run_minimap2_rust_polish(options, &inputs, &paths, &mut command_records)?;
-    let polish_seconds = polish_started.elapsed().as_secs_f64();
+    let (round_reports, alignment_report) = if options.validate_round == 1 {
+        let polish_started = Instant::now();
+        let round_reports =
+            run_minimap2_rust_polish(options, &inputs, &paths, &mut command_records)?;
+        let polish_seconds = polish_started.elapsed().as_secs_f64();
+
+        let align_started = Instant::now();
+        let alignment_report = align_polished_to_reference(&inputs, &paths, &mut command_records)?;
+        let align_seconds = align_started.elapsed().as_secs_f64();
+
+        stage_records.push(StageRecord::ok(
+            "polish",
+            "setup",
+            polish_seconds,
+            "minimap2 pileup polish completed",
+        ));
+        stage_records.push(StageRecord::ok(
+            "align-reference",
+            "setup",
+            align_seconds,
+            "polished FASTA aligned to rotated reference coordinates",
+        ));
+        (round_reports, Some(alignment_report))
+    } else {
+        stage_records.push(StageRecord::skipped(
+            "polish",
+            validation_round.clone(),
+            "validation-only workflow round; using corrected checkpoint FASTA directly",
+        ));
+        stage_records.push(StageRecord::skipped(
+            "align-reference",
+            validation_round.clone(),
+            "validation-only workflow round; input is already in reference-aligned coordinates",
+        ));
+        (Vec::new(), None)
+    };
     cleanup_input_sidecars(&paths)?;
-
-    let align_started = Instant::now();
-    let alignment_report = align_polished_to_reference(&inputs, &paths, &mut command_records)?;
-    let align_seconds = align_started.elapsed().as_secs_f64();
 
     let sv_eval_started = Instant::now();
     let sv_eval_report = if options.per_read_variant_calls {
@@ -299,48 +324,28 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
         )?;
         Some(StageRecord::ok(
             "plot",
-            "round_1",
+            validation_round.clone(),
             plot_started.elapsed().as_secs_f64(),
             "SV support and SNV/InDel plots generated when Python was available",
         ))
     } else {
         Some(StageRecord::skipped(
             "plot",
-            "round_1",
+            validation_round.clone(),
             "disabled because --per-read-variant-calls off",
         ))
     };
 
-    let mut stage_records = vec![
-        StageRecord::ok(
-            "prepare",
-            "setup",
-            prepare_seconds,
-            "polish workspace initialized",
-        ),
-        StageRecord::ok(
-            "polish",
-            "setup",
-            polish_seconds,
-            "minimap2 pileup polish completed",
-        ),
-        StageRecord::ok(
-            "align-reference",
-            "setup",
-            align_seconds,
-            "polished FASTA aligned to rotated reference coordinates",
-        ),
-    ];
     if options.per_read_variant_calls {
         stage_records.push(StageRecord::ok(
             "sv-eval",
-            "round_1",
+            validation_round.clone(),
             sv_eval_seconds,
             "read-level minimap2 SV evidence written",
         ));
         stage_records.push(StageRecord::ok(
             "snv-indel-eval",
-            "round_1",
+            validation_round.clone(),
             snv_indel_seconds,
             "per-read SNP/InDel calls written",
         ));
@@ -350,12 +355,12 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
     } else {
         stage_records.push(StageRecord::skipped(
             "sv-eval",
-            "round_1",
+            validation_round.clone(),
             "disabled by --per-read-variant-calls off",
         ));
         stage_records.push(StageRecord::skipped(
             "snv-indel-eval",
-            "round_1",
+            validation_round,
             "disabled by --per-read-variant-calls off",
         ));
         if let Some(record) = plot_stage {
@@ -371,15 +376,17 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
         &extracted_reference,
         &stage_records,
         &round_reports,
-        &alignment_report,
+        alignment_report.as_ref(),
         sv_eval_report.as_ref(),
         snv_indel_report.as_ref(),
         &command_records,
     )?;
 
-    println!("Wrote {}", paths.subgraph_dir.display());
-    println!("Wrote {}", paths.polished_fasta.display());
-    println!("Wrote {}", paths.aligned_fasta.display());
+    println!("Wrote {}", paths.round_dir.display());
+    if options.validate_round == 1 {
+        println!("Wrote {}", paths.polished_fasta.display());
+        println!("Wrote {}", paths.aligned_fasta.display());
+    }
     println!("Wrote {}", paths.report.display());
     Ok(())
 }
@@ -398,14 +405,14 @@ fn contract() -> CommandContract {
             "soft_paths.txt containing minimap2, blastn, and optionally python for plotting",
         ],
         outputs: &[
-            "ORGANELLE/SUBGRAPH/01.inputs with extracted draft/reference FASTA files and linked reads",
-            "ORGANELLE/SUBGRAPH/02.polish/polished[.round_N].fasta final polished sequence",
-            "ORGANELLE/SUBGRAPH/02.polish/polished_aln[.round_N].fasta reference-aligned polished sequence",
-            "ORGANELLE/SUBGRAPH/logs/report[.round_N].tsv for metadata, status, round metrics, and commands",
-            "ORGANELLE/SUBGRAPH/logs/external[.round_N].stderr.log for combined minimap2/blastn stderr",
-            "ORGANELLE/SUBGRAPH/03.validate/round_*/{01.data,02.plots,03.reports}",
-            "ORGANELLE/SUBGRAPH/03.validate/round_N/02.plots/plot_sv_support.py and plot_snv_indel.py for optional plotting",
-            "ORGANELLE/SUBGRAPH/03.validate/round_N/01.data/snv_indel_calls.tsv with read-level SNP/InDel evidence",
+            "ORGANELLE/SUBGRAPH/round_N/01.inputs with extracted draft/reference FASTA files and linked reads",
+            "ORGANELLE/SUBGRAPH/round_1/02.polish/polished.fasta final polished sequence",
+            "ORGANELLE/SUBGRAPH/round_1/02.polish/polished_aln.fasta reference-aligned polished sequence",
+            "ORGANELLE/SUBGRAPH/round_N/logs/report.tsv for metadata, status, round metrics, and commands",
+            "ORGANELLE/SUBGRAPH/round_N/logs/external.stderr.log for combined minimap2/blastn stderr",
+            "ORGANELLE/SUBGRAPH/round_N/03.validate/{01.data,02.plots,03.reports}",
+            "ORGANELLE/SUBGRAPH/round_N/03.validate/02.plots/plot_sv_support.py and plot_snv_indel.py for optional plotting",
+            "ORGANELLE/SUBGRAPH/round_N/03.validate/01.data/snv_indel_calls.tsv with read-level SNP/InDel evidence",
         ],
         notes: &[
             "one command invocation owns one organelle subgraph; batch multi-subgraph runs can call this command repeatedly",
@@ -693,6 +700,7 @@ impl ResolvedInputs {
 struct PolishPaths {
     validate_round: usize,
     subgraph_dir: PathBuf,
+    round_dir: PathBuf,
     inputs_dir: PathBuf,
     polish_dir: PathBuf,
     eval_dir: PathBuf,
@@ -733,23 +741,16 @@ struct PolishPaths {
 impl PolishPaths {
     fn new(out_dir: &Path, organelle: &str, subgraph: &str, validate_round: usize) -> Self {
         let subgraph_dir = out_dir.join(organelle).join(subgraph);
-        let inputs_dir = subgraph_dir.join("01.inputs");
-        let polish_dir = subgraph_dir.join("02.polish");
-        let eval_dir = subgraph_dir.join("03.validate");
-        let round_label = format!("round_{validate_round}");
-        let round_suffix = if validate_round == 1 {
-            String::new()
+        let round_dir = subgraph_dir.join(format!("round_{validate_round}"));
+        let inputs_dir = round_dir.join("01.inputs");
+        let polish_dir = round_dir.join("02.polish");
+        let eval_dir = round_dir.join("03.validate");
+        let input_draft_name = if validate_round == 1 {
+            "linear_subgraph.fasta".to_string()
         } else {
-            format!(".round_{validate_round}")
+            format!("linear_subgraph.round_{validate_round}.fasta")
         };
-        let round_file = |stem: &str, extension: &str| {
-            if round_suffix.is_empty() {
-                format!("{stem}.{extension}")
-            } else {
-                format!("{stem}{round_suffix}.{extension}")
-            }
-        };
-        let round1_dir = eval_dir.join(&round_label);
+        let round1_dir = eval_dir.clone();
         let round1_data_dir = round1_dir.join("01.data");
         let round1_plots_dir = round1_dir.join("02.plots");
         let round1_reports_dir = round1_dir.join("03.reports");
@@ -761,16 +762,17 @@ impl PolishPaths {
         let round1_snv_indel_reports_dir = round1_reports_dir;
         let round1_snv_indel_plots_dir = round1_plots_dir.clone();
         let round1_sv_plots_dir = round1_plots_dir;
-        let logs_dir = subgraph_dir.join("logs");
+        let logs_dir = round_dir.join("logs");
         Self {
             validate_round,
-            report: logs_dir.join(round_file("report", "tsv")),
-            external_stderr: logs_dir.join(round_file("external.stderr", "log")),
-            input_draft: inputs_dir.join(round_file("linear_subgraph", "fasta")),
-            input_reference: inputs_dir.join(round_file("rotated_reference", "fasta")),
-            input_reads: inputs_dir.join(round_file("subgraph_reads", "fastq.gz")),
-            polished_fasta: polish_dir.join(round_file("polished", "fasta")),
-            aligned_fasta: polish_dir.join(round_file("polished_aln", "fasta")),
+            round_dir,
+            report: logs_dir.join("report.tsv"),
+            external_stderr: logs_dir.join("external.stderr.log"),
+            input_draft: inputs_dir.join(input_draft_name),
+            input_reference: inputs_dir.join("rotated_reference.fasta"),
+            input_reads: inputs_dir.join("subgraph_reads.fastq.gz"),
+            polished_fasta: polish_dir.join("polished.fasta"),
+            aligned_fasta: polish_dir.join("polished_aln.fasta"),
             round1_sv_whole_read_evidence: round1_sv_data_dir.join("sv_read_evidence.tsv"),
             round1_sv_group_summary: round1_sv_reports_dir.join("sv_group_stats.tsv"),
             round1_sv_subgroup_summary: round1_sv_reports_dir.join("sv_subgroup_stats.tsv"),
@@ -810,6 +812,7 @@ impl PolishPaths {
 
     fn create_dirs(&self) -> Result<(), OrgraftError> {
         for path in [
+            &self.round_dir,
             &self.inputs_dir,
             &self.polish_dir,
             &self.eval_dir,
@@ -830,50 +833,55 @@ impl PolishPaths {
     }
 
     fn polished_round_fasta(&self, round: usize) -> PathBuf {
+        self.polish_dir
+            .join(format!("polished_round_{round}.fasta"))
+    }
+
+    fn validation_fasta(&self) -> &Path {
         if self.validate_round == 1 {
-            self.polish_dir
-                .join(format!("polished_round_{round}.fasta"))
+            &self.aligned_fasta
         } else {
-            self.polish_dir.join(format!(
-                "polished_round_{round}.round_{}.fasta",
-                self.validate_round
-            ))
+            &self.input_draft
         }
     }
 }
 
 #[derive(Debug)]
 struct StageRecord {
-    stage: &'static str,
-    round: &'static str,
+    stage: String,
+    round: String,
     status: &'static str,
     elapsed_seconds: Option<f64>,
-    message: &'static str,
+    message: String,
 }
 
 impl StageRecord {
     fn ok(
-        stage: &'static str,
-        round: &'static str,
+        stage: impl Into<String>,
+        round: impl Into<String>,
         elapsed_seconds: f64,
-        message: &'static str,
+        message: impl Into<String>,
     ) -> Self {
         Self {
-            stage,
-            round,
+            stage: stage.into(),
+            round: round.into(),
             status: "ok",
             elapsed_seconds: Some(elapsed_seconds),
-            message,
+            message: message.into(),
         }
     }
 
-    fn skipped(stage: &'static str, round: &'static str, message: &'static str) -> Self {
+    fn skipped(
+        stage: impl Into<String>,
+        round: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            stage,
-            round,
+            stage: stage.into(),
+            round: round.into(),
             status: "skipped",
             elapsed_seconds: None,
-            message,
+            message: message.into(),
         }
     }
 }
@@ -1248,7 +1256,7 @@ fn run_sv_eval_round1(
     let soft_paths = read_soft_paths(&inputs.soft_paths)?;
     let minimap2 = require_tool(&soft_paths, "minimap2")?;
     let reads = read_sequence_records(&paths.input_reads)?;
-    let reference_by_id = read_fasta_records_by_id(&paths.aligned_fasta)?;
+    let reference_by_id = read_fasta_records_by_id(paths.validation_fasta())?;
     let reference_len = reference_by_id
         .values()
         .next()
@@ -1258,7 +1266,7 @@ fn run_sv_eval_round1(
     let (paf_by_read, minimap2_workers) = run_sv_minimap2_batch(
         &minimap2,
         options,
-        &paths.aligned_fasta,
+        paths.validation_fasta(),
         &paths.input_reads,
         &paths.external_stderr,
         commands,
@@ -1531,7 +1539,7 @@ fn run_snv_indel_eval_round1(
     let started = Instant::now();
     let (results, worker_count, stream_metrics) = run_custom_variant_caller_segments(
         &minimap2,
-        &paths.aligned_fasta,
+        paths.validation_fasta(),
         &segment_fasta,
         &segments,
         options.threads,
@@ -1588,7 +1596,7 @@ fn run_snv_indel_eval_round1(
         shared_minimap2_stream_seconds: stream_metrics.alignment_seconds,
         sum_segment_seconds,
         split_sam_records: stream_metrics.split_sam_records,
-        reference_path: display_path(&paths.aligned_fasta),
+        reference_path: display_path(paths.validation_fasta()),
         call_mode: "rust",
         overlap_policy: options.snv_indel_overlap_policy.as_str(),
         sv_context_filter: SNV_INDEL_SV_CONTEXT_FILTER,
@@ -1601,7 +1609,7 @@ fn run_snv_indel_eval_round1(
         &paths.round1_snv_indel_plot_points,
         &paths.round1_sv_support_summary,
         &runtime_summary,
-        &paths.aligned_fasta,
+        paths.validation_fasta(),
         &paths.round1_sv_coverage,
         &segments,
         &results,
@@ -1639,7 +1647,7 @@ fn run_snv_indel_eval_round1(
         plot_points_path: paths.round1_snv_indel_plot_points.clone(),
         plot_script_path: paths.round1_snv_indel_plot_script.clone(),
         summary_path: paths.round1_sv_support_summary.clone(),
-        reference_path: paths.aligned_fasta.clone(),
+        reference_path: paths.validation_fasta().to_path_buf(),
         call_mode: "rust",
         overlap_policy: options.snv_indel_overlap_policy.as_str(),
         sv_context_filter: SNV_INDEL_SV_CONTEXT_FILTER,
@@ -7239,7 +7247,7 @@ fn write_report(
     extracted_reference: &FastaRecordInfo,
     stage_records: &[StageRecord],
     round_reports: &[PileupRoundReport],
-    alignment_report: &AlignmentReport,
+    alignment_report: Option<&AlignmentReport>,
     sv_eval_report: Option<&SvEvalReport>,
     snv_indel_report: Option<&SnvIndelReport>,
     command_records: &[CommandRecord],
@@ -7435,6 +7443,13 @@ fn write_report(
     write_report_row(
         &mut file,
         "output",
+        "workflow_round",
+        "dir",
+        &display_path(&paths.round_dir),
+    )?;
+    write_report_row(
+        &mut file,
+        "output",
         "draft",
         "path",
         &display_path(&paths.input_draft),
@@ -7449,24 +7464,33 @@ fn write_report(
     write_report_row(
         &mut file,
         "output",
-        "polished_round_1",
+        "validation_fasta",
         "path",
-        &display_path(&paths.polished_round_fasta(1)),
+        &display_path(paths.validation_fasta()),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "polished",
-        "path",
-        &display_path(&paths.polished_fasta),
-    )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "polished_aligned",
-        "path",
-        &display_path(&paths.aligned_fasta),
-    )?;
+    if options.validate_round == 1 {
+        write_report_row(
+            &mut file,
+            "output",
+            "polished_round_1",
+            "path",
+            &display_path(&paths.polished_round_fasta(1)),
+        )?;
+        write_report_row(
+            &mut file,
+            "output",
+            "polished",
+            "path",
+            &display_path(&paths.polished_fasta),
+        )?;
+        write_report_row(
+            &mut file,
+            "output",
+            "polished_aligned",
+            "path",
+            &display_path(&paths.aligned_fasta),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7633,7 +7657,7 @@ fn write_report(
                 &format!("{elapsed_seconds:.3}"),
             )?;
         }
-        write_report_row(&mut file, "stage", &name, "message", record.message)?;
+        write_report_row(&mut file, "stage", &name, "message", &record.message)?;
     }
     for report in round_reports {
         let name = format!("round_{}", report.round);
@@ -7687,7 +7711,9 @@ fn write_report(
             &report.low_coverage_bases.to_string(),
         )?;
     }
-    write_alignment_report_rows(&mut file, alignment_report)?;
+    if let Some(alignment_report) = alignment_report {
+        write_alignment_report_rows(&mut file, alignment_report)?;
+    }
     if let Some(report) = sv_eval_report {
         write_sv_eval_report_rows(&mut file, report)?;
     }
@@ -9126,101 +9152,105 @@ mod tests {
             PathBuf::from("results/polish/mito/subgraph_002")
         );
         assert_eq!(
+            paths.round_dir,
+            PathBuf::from("results/polish/mito/subgraph_002/round_1")
+        );
+        assert_eq!(
             paths.round1_snv_indel_dir,
-            PathBuf::from("results/polish/mito/subgraph_002/03.validate/round_1")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/03.validate")
         );
         assert_eq!(
             paths.round1_snv_indel_data_dir,
-            PathBuf::from("results/polish/mito/subgraph_002/03.validate/round_1/01.data")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/03.validate/01.data")
         );
         assert_eq!(
             paths.round1_snv_indel_reports_dir,
-            PathBuf::from("results/polish/mito/subgraph_002/03.validate/round_1/03.reports")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/03.validate/03.reports")
         );
         assert_eq!(
             paths.round1_snv_indel_plots_dir,
-            PathBuf::from("results/polish/mito/subgraph_002/03.validate/round_1/02.plots")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/03.validate/02.plots")
         );
         assert_eq!(
             paths.report,
-            PathBuf::from("results/polish/mito/subgraph_002/logs/report.tsv")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/logs/report.tsv")
         );
         assert_eq!(
             paths.external_stderr,
-            PathBuf::from("results/polish/mito/subgraph_002/logs/external.stderr.log")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/logs/external.stderr.log")
         );
         assert_eq!(
             paths.aligned_fasta,
-            PathBuf::from("results/polish/mito/subgraph_002/02.polish/polished_aln.fasta")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/02.polish/polished_aln.fasta")
         );
         assert_eq!(
             paths.polished_fasta,
-            PathBuf::from("results/polish/mito/subgraph_002/02.polish/polished.fasta")
+            PathBuf::from("results/polish/mito/subgraph_002/round_1/02.polish/polished.fasta")
         );
         assert_eq!(
             paths.round1_sv_whole_read_evidence,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/01.data/sv_read_evidence.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/01.data/sv_read_evidence.tsv"
             )
         );
         assert_eq!(
             paths.round1_sv_group_summary,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/03.reports/sv_group_stats.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/03.reports/sv_group_stats.tsv"
             )
         );
         assert_eq!(
             paths.round1_sv_support_summary,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/03.reports/sv_snv_indel_summary.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/03.reports/sv_snv_indel_summary.tsv"
             )
         );
         assert_eq!(
             paths.round1_sv_high_subgroup_report,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/03.reports/sv_high_subgroups.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/03.reports/sv_high_subgroups.tsv"
             )
         );
         assert_eq!(
             paths.round1_sv_coverage,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/01.data/sv_coverage.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/01.data/sv_coverage.tsv"
             )
         );
         assert_eq!(
             paths.round1_plot_script,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/02.plots/plot_sv_support.py"
+                "results/polish/mito/subgraph_002/round_1/03.validate/02.plots/plot_sv_support.py"
             )
         );
         assert_eq!(
             paths.round1_snv_indel_variant_type_annotations,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/01.data/snv_indel_variants.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/01.data/snv_indel_variants.tsv"
             )
         );
         assert_eq!(
             paths.round1_snv_indel_variant_type_annotations_combined,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/01.data/snv_indel_variants_combined.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/01.data/snv_indel_variants_combined.tsv"
             )
         );
         assert_eq!(
             paths.round1_snv_indel_variant_type_annotations_combined_high,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/03.reports/snv_indel_high.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/03.reports/snv_indel_high.tsv"
             )
         );
         assert_eq!(
             paths.round1_snv_indel_plot_points,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/01.data/snv_indel_plot_points.tsv"
+                "results/polish/mito/subgraph_002/round_1/03.validate/01.data/snv_indel_plot_points.tsv"
             )
         );
         assert_eq!(
             paths.round1_snv_indel_plot_script,
             PathBuf::from(
-                "results/polish/mito/subgraph_002/03.validate/round_1/02.plots/plot_snv_indel.py"
+                "results/polish/mito/subgraph_002/round_1/03.validate/02.plots/plot_snv_indel.py"
             )
         );
         assert!(options.per_read_variant_calls);
@@ -9261,24 +9291,44 @@ mod tests {
             PathBuf::from("results_workflow/04.polish/mito/subgraph_001")
         );
         assert_eq!(
+            paths.round_dir,
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/round_2")
+        );
+        assert_eq!(
             paths.round1_snv_indel_dir,
-            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/03.validate/round_2")
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/round_2/03.validate")
         );
         assert_eq!(
             paths.round1_sv_support_summary,
             PathBuf::from(
-                "results_workflow/04.polish/mito/subgraph_001/03.validate/round_2/03.reports/sv_snv_indel_summary.tsv"
+                "results_workflow/04.polish/mito/subgraph_001/round_2/03.validate/03.reports/sv_snv_indel_summary.tsv"
             )
         );
         assert_eq!(
-            paths.aligned_fasta,
+            paths.input_draft,
             PathBuf::from(
-                "results_workflow/04.polish/mito/subgraph_001/02.polish/polished_aln.round_2.fasta"
+                "results_workflow/04.polish/mito/subgraph_001/round_2/01.inputs/linear_subgraph.round_2.fasta"
             )
+        );
+        assert_eq!(
+            paths.input_reference,
+            PathBuf::from(
+                "results_workflow/04.polish/mito/subgraph_001/round_2/01.inputs/rotated_reference.fasta"
+            )
+        );
+        assert_eq!(
+            paths.input_reads,
+            PathBuf::from(
+                "results_workflow/04.polish/mito/subgraph_001/round_2/01.inputs/subgraph_reads.fastq.gz"
+            )
+        );
+        assert_eq!(
+            paths.validation_fasta(),
+            Path::new("results_workflow/04.polish/mito/subgraph_001/round_2/01.inputs/linear_subgraph.round_2.fasta")
         );
         assert_eq!(
             paths.report,
-            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/logs/report.round_2.tsv")
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/round_2/logs/report.tsv")
         );
     }
 

@@ -3519,31 +3519,16 @@ fn resolve_gfa_editor_cli(soft_paths: &HashMap<String, PathBuf>) -> Result<PathB
 }
 
 fn discover_validate_data_dir(polished_fasta: &Path) -> Option<PathBuf> {
-    let polish_subgraph_dir = polished_fasta.parent().and_then(Path::parent)?;
-    let round = polished_fasta
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(validate_round_from_polished_name)
-        .unwrap_or(1);
-    let candidate = polish_subgraph_dir.join(format!("03.validate/round_{round}/01.data"));
+    let file_dir = polished_fasta.parent()?;
+    let round_dir = match file_dir.file_name().and_then(|name| name.to_str()) {
+        Some("01.inputs") | Some("02.polish") => file_dir.parent()?,
+        _ => return None,
+    };
+    let candidate = round_dir.join("03.validate/01.data");
     if candidate.is_dir() {
         Some(candidate)
     } else {
         None
-    }
-}
-
-fn validate_round_from_polished_name(name: &str) -> Option<usize> {
-    let marker = ".round_";
-    let start = name.find(marker)? + marker.len();
-    let digits: String = name[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse::<usize>().ok().filter(|round| *round > 0)
     }
 }
 
@@ -3732,15 +3717,15 @@ mod tests {
     }
 
     #[test]
-    fn discover_validate_data_dir_uses_polished_round_suffix() {
+    fn discover_validate_data_dir_uses_workflow_round_directory() {
         let base = std::env::temp_dir().join(format!(
             "orgraft-rebuild-round-suffix-{}",
             std::process::id()
         ));
-        let subgraph_dir = base.join("04.polish/mito/subgraph_001");
-        let data_dir = subgraph_dir.join("03.validate/round_2/01.data");
+        let round_dir = base.join("04.polish/mito/subgraph_001/round_2");
+        let data_dir = round_dir.join("03.validate/01.data");
         fs::create_dir_all(&data_dir).unwrap();
-        let polished = subgraph_dir.join("02.polish/polished_aln.round_2.fasta");
+        let polished = round_dir.join("01.inputs/linear_subgraph.round_2.fasta");
         fs::create_dir_all(polished.parent().unwrap()).unwrap();
         fs::write(&polished, ">x\nACGT\n").unwrap();
 
