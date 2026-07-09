@@ -34,6 +34,7 @@ Outputs:
 Additional Parameters:
   --threads N                             worker threads [8]
   --max-rounds N                          planned validation rounds [3]
+  --validate-round N                      workflow validation round directory [1]
   --per-read-variant-calls on|off         run read-level SV/SNP-InDel evidence stages [on]
   --snv-indel-overlap-policy MODE         mark-overlap|mask-both|assign-downstream [mark-overlap]
   --plot-help                             show advanced plot tuning options
@@ -63,7 +64,7 @@ SNV/InDel:
   --snv-indel-plot-low-min-fraction FLOAT grey SNV/InDel points below this frequency [0]
   --snv-indel-plot-high-risk-fraction F   orange/red highlight threshold for SNV/InDel points [0.5]
 
-Generated scripts in 03.validate/round_1/02.plots also provide their own --help for replotting.
+Generated scripts in 03.validate/round_N/02.plots also provide their own --help for replotting.
 "#;
 
 const DEFAULT_SUBGRAPH: &str = "subgraph_001";
@@ -196,20 +197,39 @@ pub fn run(args: &[String]) -> Result<(), OrgraftError> {
 fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
     let started = Instant::now();
     let inputs = ResolvedInputs::from_options(options)?;
-    let paths = PolishPaths::new(&options.out_dir, &options.organelle, &options.subgraph);
+    let paths = PolishPaths::new(
+        &options.out_dir,
+        &options.organelle,
+        &options.subgraph,
+        options.validate_round,
+    );
 
     if paths.subgraph_dir.exists() {
-        if options.force {
-            fs::remove_dir_all(&paths.subgraph_dir)?;
-        } else {
-            return Err(OrgraftError::InvalidArgument(format!(
-                "{} already exists; use --force to replace this subgraph workspace",
-                paths.subgraph_dir.display()
-            )));
+        if options.validate_round == 1 {
+            if options.force {
+                fs::remove_dir_all(&paths.subgraph_dir)?;
+            } else {
+                return Err(OrgraftError::InvalidArgument(format!(
+                    "{} already exists; use --force to replace this subgraph workspace",
+                    paths.subgraph_dir.display()
+                )));
+            }
+        } else if paths.round1_dir.exists() {
+            if options.force {
+                fs::remove_dir_all(&paths.round1_dir)?;
+            } else {
+                return Err(OrgraftError::InvalidArgument(format!(
+                    "{} already exists; use --force to replace this validation round",
+                    paths.round1_dir.display()
+                )));
+            }
         }
     }
 
     paths.create_dirs()?;
+    if fs::symlink_metadata(&paths.input_reads).is_ok() {
+        fs::remove_file(&paths.input_reads)?;
+    }
     let extracted_draft = extract_fasta_record_by_id(
         &inputs.draft,
         &paths.input_draft,
@@ -379,13 +399,13 @@ fn contract() -> CommandContract {
         ],
         outputs: &[
             "ORGANELLE/SUBGRAPH/01.inputs with extracted draft/reference FASTA files and linked reads",
-            "ORGANELLE/SUBGRAPH/02.polish/polished.fasta final polished sequence",
-            "ORGANELLE/SUBGRAPH/02.polish/polished_aln.fasta reference-aligned polished sequence",
-            "ORGANELLE/SUBGRAPH/logs/report.tsv for metadata, status, round metrics, and commands",
-            "ORGANELLE/SUBGRAPH/logs/external.stderr.log for combined minimap2/blastn stderr",
+            "ORGANELLE/SUBGRAPH/02.polish/polished[.round_N].fasta final polished sequence",
+            "ORGANELLE/SUBGRAPH/02.polish/polished_aln[.round_N].fasta reference-aligned polished sequence",
+            "ORGANELLE/SUBGRAPH/logs/report[.round_N].tsv for metadata, status, round metrics, and commands",
+            "ORGANELLE/SUBGRAPH/logs/external[.round_N].stderr.log for combined minimap2/blastn stderr",
             "ORGANELLE/SUBGRAPH/03.validate/round_*/{01.data,02.plots,03.reports}",
-            "ORGANELLE/SUBGRAPH/03.validate/round_1/02.plots/plot_sv_support.py and plot_snv_indel.py for optional plotting",
-            "ORGANELLE/SUBGRAPH/03.validate/round_1/01.data/snv_indel_calls.tsv with read-level SNP/InDel evidence",
+            "ORGANELLE/SUBGRAPH/03.validate/round_N/02.plots/plot_sv_support.py and plot_snv_indel.py for optional plotting",
+            "ORGANELLE/SUBGRAPH/03.validate/round_N/01.data/snv_indel_calls.tsv with read-level SNP/InDel evidence",
         ],
         notes: &[
             "one command invocation owns one organelle subgraph; batch multi-subgraph runs can call this command repeatedly",
@@ -409,6 +429,7 @@ struct PolishOptions {
     out_dir: PathBuf,
     threads: usize,
     max_rounds: usize,
+    validate_round: usize,
     force: bool,
     per_read_variant_calls: bool,
     snv_indel_overlap_policy: SnvIndelOverlapPolicy,
@@ -438,6 +459,7 @@ impl PolishOptions {
         let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
         let mut threads = 8usize;
         let mut max_rounds = 3usize;
+        let mut validate_round = 1usize;
         let mut force = false;
         let mut per_read_variant_calls = true;
         let mut snv_indel_overlap_policy = SnvIndelOverlapPolicy::MarkOverlap;
@@ -485,6 +507,14 @@ impl PolishOptions {
                 }
                 "--max-rounds" => {
                     max_rounds = parse_usize(required_value(args, &mut index, arg)?, arg)?;
+                }
+                "--validate-round" | "--workflow-round" => {
+                    validate_round = parse_usize(required_value(args, &mut index, arg)?, arg)?;
+                    if validate_round == 0 {
+                        return Err(OrgraftError::InvalidArgument(
+                            "--validate-round must be at least 1".to_string(),
+                        ));
+                    }
                 }
                 "--per-read-variant-calls" => {
                     per_read_variant_calls =
@@ -591,6 +621,7 @@ impl PolishOptions {
             out_dir,
             threads: threads.max(1),
             max_rounds: max_rounds.max(1),
+            validate_round,
             force,
             per_read_variant_calls,
             snv_indel_overlap_policy,
@@ -660,6 +691,7 @@ impl ResolvedInputs {
 
 #[derive(Debug, Clone)]
 struct PolishPaths {
+    validate_round: usize,
     subgraph_dir: PathBuf,
     inputs_dir: PathBuf,
     polish_dir: PathBuf,
@@ -699,12 +731,25 @@ struct PolishPaths {
 }
 
 impl PolishPaths {
-    fn new(out_dir: &Path, organelle: &str, subgraph: &str) -> Self {
+    fn new(out_dir: &Path, organelle: &str, subgraph: &str, validate_round: usize) -> Self {
         let subgraph_dir = out_dir.join(organelle).join(subgraph);
         let inputs_dir = subgraph_dir.join("01.inputs");
         let polish_dir = subgraph_dir.join("02.polish");
         let eval_dir = subgraph_dir.join("03.validate");
-        let round1_dir = eval_dir.join("round_1");
+        let round_label = format!("round_{validate_round}");
+        let round_suffix = if validate_round == 1 {
+            String::new()
+        } else {
+            format!(".round_{validate_round}")
+        };
+        let round_file = |stem: &str, extension: &str| {
+            if round_suffix.is_empty() {
+                format!("{stem}.{extension}")
+            } else {
+                format!("{stem}{round_suffix}.{extension}")
+            }
+        };
+        let round1_dir = eval_dir.join(&round_label);
         let round1_data_dir = round1_dir.join("01.data");
         let round1_plots_dir = round1_dir.join("02.plots");
         let round1_reports_dir = round1_dir.join("03.reports");
@@ -718,13 +763,14 @@ impl PolishPaths {
         let round1_sv_plots_dir = round1_plots_dir;
         let logs_dir = subgraph_dir.join("logs");
         Self {
-            report: logs_dir.join("report.tsv"),
-            external_stderr: logs_dir.join("external.stderr.log"),
-            input_draft: inputs_dir.join("linear_subgraph.fasta"),
-            input_reference: inputs_dir.join("rotated_reference.fasta"),
-            input_reads: inputs_dir.join("subgraph_reads.fastq.gz"),
-            polished_fasta: polish_dir.join("polished.fasta"),
-            aligned_fasta: polish_dir.join("polished_aln.fasta"),
+            validate_round,
+            report: logs_dir.join(round_file("report", "tsv")),
+            external_stderr: logs_dir.join(round_file("external.stderr", "log")),
+            input_draft: inputs_dir.join(round_file("linear_subgraph", "fasta")),
+            input_reference: inputs_dir.join(round_file("rotated_reference", "fasta")),
+            input_reads: inputs_dir.join(round_file("subgraph_reads", "fastq.gz")),
+            polished_fasta: polish_dir.join(round_file("polished", "fasta")),
+            aligned_fasta: polish_dir.join(round_file("polished_aln", "fasta")),
             round1_sv_whole_read_evidence: round1_sv_data_dir.join("sv_read_evidence.tsv"),
             round1_sv_group_summary: round1_sv_reports_dir.join("sv_group_stats.tsv"),
             round1_sv_subgroup_summary: round1_sv_reports_dir.join("sv_subgroup_stats.tsv"),
@@ -784,8 +830,15 @@ impl PolishPaths {
     }
 
     fn polished_round_fasta(&self, round: usize) -> PathBuf {
-        self.polish_dir
-            .join(format!("polished_round_{round}.fasta"))
+        if self.validate_round == 1 {
+            self.polish_dir
+                .join(format!("polished_round_{round}.fasta"))
+        } else {
+            self.polish_dir.join(format!(
+                "polished_round_{round}.round_{}.fasta",
+                self.validate_round
+            ))
+        }
     }
 }
 
@@ -7216,6 +7269,13 @@ fn write_report(
         "max_rounds",
         &options.max_rounds.to_string(),
     )?;
+    write_report_row(
+        &mut file,
+        "global",
+        "run",
+        "validate_round",
+        &options.validate_round.to_string(),
+    )?;
     write_report_row(&mut file, "global", "run", "created_at", &timestamp())?;
     write_report_row(
         &mut file,
@@ -9055,7 +9115,12 @@ mod tests {
             "reads.fastq.gz".to_string(),
         ];
         let options = PolishOptions::from_args(&args).unwrap();
-        let paths = PolishPaths::new(&options.out_dir, &options.organelle, &options.subgraph);
+        let paths = PolishPaths::new(
+            &options.out_dir,
+            &options.organelle,
+            &options.subgraph,
+            options.validate_round,
+        );
         assert_eq!(
             paths.subgraph_dir,
             PathBuf::from("results/polish/mito/subgraph_002")
@@ -9162,6 +9227,58 @@ mod tests {
         assert_eq!(
             options.snv_indel_overlap_policy,
             SnvIndelOverlapPolicy::MarkOverlap
+        );
+    }
+
+    #[test]
+    fn validate_round_changes_internal_validate_directory_only() {
+        let args = vec![
+            "--organelle".to_string(),
+            "mito".to_string(),
+            "--subgraph".to_string(),
+            "subgraph_001".to_string(),
+            "--draft".to_string(),
+            "draft.fa".to_string(),
+            "--reference".to_string(),
+            "ref.fa".to_string(),
+            "--reads".to_string(),
+            "reads.fastq.gz".to_string(),
+            "--out-dir".to_string(),
+            "results_workflow/04.polish".to_string(),
+            "--validate-round".to_string(),
+            "2".to_string(),
+        ];
+        let options = PolishOptions::from_args(&args).unwrap();
+        let paths = PolishPaths::new(
+            &options.out_dir,
+            &options.organelle,
+            &options.subgraph,
+            options.validate_round,
+        );
+        assert_eq!(options.validate_round, 2);
+        assert_eq!(
+            paths.subgraph_dir,
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001")
+        );
+        assert_eq!(
+            paths.round1_snv_indel_dir,
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/03.validate/round_2")
+        );
+        assert_eq!(
+            paths.round1_sv_support_summary,
+            PathBuf::from(
+                "results_workflow/04.polish/mito/subgraph_001/03.validate/round_2/03.reports/sv_snv_indel_summary.tsv"
+            )
+        );
+        assert_eq!(
+            paths.aligned_fasta,
+            PathBuf::from(
+                "results_workflow/04.polish/mito/subgraph_001/02.polish/polished_aln.round_2.fasta"
+            )
+        );
+        assert_eq!(
+            paths.report,
+            PathBuf::from("results_workflow/04.polish/mito/subgraph_001/logs/report.round_2.tsv")
         );
     }
 

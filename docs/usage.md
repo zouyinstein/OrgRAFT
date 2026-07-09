@@ -209,6 +209,13 @@ results_workflow/
   02.draft_asm/
   03.resolve_gfa/
   04.polish/
+    mito/subgraph_001/
+      02.polish/
+        polished_aln.fasta
+        polished_aln.round_2.fasta
+      03.validate/
+        round_1/
+        round_2/
   05.rebuild/
   workflow/
     mito/subgraph_001/

@@ -2209,6 +2209,8 @@ fn run_polish_round(
         config.soft_paths.display().to_string(),
         "--out-dir".to_string(),
         polish_run_out_dir(case, round).display().to_string(),
+        "--validate-round".to_string(),
+        round.to_string(),
         "--threads".to_string(),
         polish_threads(config).to_string(),
         "--max-rounds".to_string(),
@@ -3262,9 +3264,7 @@ fn runtime_stage_rows(config: &WorkflowConfig) -> Result<Vec<RuntimeStageRow>, O
         });
 
         for round in 1..=config.max_rounds {
-            let polish_report = polish_round_dir(case, round)
-                .join("logs")
-                .join("report.tsv");
+            let polish_report = polish_report_path(case, round);
             if polish_report.exists() {
                 rows.push(RuntimeStageRow {
                     scope: case.name.clone(),
@@ -4045,24 +4045,38 @@ fn polish_round_dir(case: &WorkflowCase, round: usize) -> PathBuf {
         .join(&case.subgraph)
 }
 
-fn polish_run_out_dir(case: &WorkflowCase, round: usize) -> PathBuf {
-    if round == 1 {
-        case.polish_out_dir.clone()
-    } else {
-        case.polish_out_dir.join(format!("round_{round}"))
-    }
+fn polish_run_out_dir(case: &WorkflowCase, _round: usize) -> PathBuf {
+    case.polish_out_dir.clone()
 }
 
 fn sv_summary_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    polish_round_dir(case, round).join("03.validate/round_1/03.reports/sv_snv_indel_summary.tsv")
+    polish_round_dir(case, round).join(format!(
+        "03.validate/round_{round}/03.reports/sv_snv_indel_summary.tsv"
+    ))
 }
 
 fn snv_indel_high_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    polish_round_dir(case, round).join("03.validate/round_1/03.reports/snv_indel_high.tsv")
+    polish_round_dir(case, round).join(format!(
+        "03.validate/round_{round}/03.reports/snv_indel_high.tsv"
+    ))
 }
 
 fn polished_aln_path(case: &WorkflowCase, round: usize) -> PathBuf {
-    polish_round_dir(case, round).join("02.polish/polished_aln.fasta")
+    let polish_dir = polish_round_dir(case, round).join("02.polish");
+    if round == 1 {
+        polish_dir.join("polished_aln.fasta")
+    } else {
+        polish_dir.join(format!("polished_aln.round_{round}.fasta"))
+    }
+}
+
+fn polish_report_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    let logs_dir = polish_round_dir(case, round).join("logs");
+    if round == 1 {
+        logs_dir.join("report.tsv")
+    } else {
+        logs_dir.join(format!("report.round_{round}.tsv"))
+    }
 }
 
 fn corrected_fasta_path(case: &WorkflowCase, round: usize) -> PathBuf {
@@ -4126,6 +4140,8 @@ fn polish_command(
         shell_quote(&config.soft_paths),
         "--out-dir".to_string(),
         shell_quote(&polish_run_out_dir(case, round)),
+        "--validate-round".to_string(),
+        round.to_string(),
         "--threads".to_string(),
         polish_threads(config).to_string(),
         "--max-rounds".to_string(),
@@ -4455,9 +4471,28 @@ reference = "mito.fa"
             polish_round_dir(case, 2),
             dir.join("results_workflow")
                 .join("04.polish")
-                .join("round_2")
                 .join("mito")
                 .join("subgraph_001")
+        );
+        assert_eq!(
+            sv_summary_path(case, 2),
+            dir.join("results_workflow")
+                .join("04.polish")
+                .join("mito")
+                .join("subgraph_001")
+                .join("03.validate")
+                .join("round_2")
+                .join("03.reports")
+                .join("sv_snv_indel_summary.tsv")
+        );
+        assert_eq!(
+            polished_aln_path(case, 2),
+            dir.join("results_workflow")
+                .join("04.polish")
+                .join("mito")
+                .join("subgraph_001")
+                .join("02.polish")
+                .join("polished_aln.round_2.fasta")
         );
         let script_path = dir.join("workflow.commands.sh");
         write_plan_script(&script_path, &config, case, None, false, true).unwrap();
@@ -4477,7 +4512,8 @@ reference = "mito.fa"
         assert!(script.contains("final_polished="));
         assert!(script.contains("\"${ORGRAFT_BIN}\" polish"));
         assert!(!script.contains("/04.polish/round_1/"));
-        assert!(script.contains("/04.polish/round_2/"));
+        assert!(!script.contains("/04.polish/round_2/"));
+        assert!(script.contains("--validate-round 2"));
         assert!(script.contains("workflow complete at checkpoint2 round 1"));
     }
 
