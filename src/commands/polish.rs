@@ -411,7 +411,7 @@ fn contract() -> CommandContract {
             "ORGANELLE/SUBGRAPH/round_N/logs/report.tsv for metadata, status, round metrics, and commands",
             "ORGANELLE/SUBGRAPH/round_N/logs/external.stderr.log for combined minimap2/blastn stderr",
             "ORGANELLE/SUBGRAPH/round_N/03.validate/{01.data,02.plots,03.reports}",
-            "ORGANELLE/SUBGRAPH/round_N/03.validate/02.plots/plot_sv_support.py and plot_snv_indel.py for optional plotting",
+            "ORGANELLE/SUBGRAPH/round_N/03.validate/02.plots with plot_sv_support.py, plot_sv_bubble.py, and plot_snv_indel.py",
             "ORGANELLE/SUBGRAPH/round_N/03.validate/01.data/snv_indel_calls.tsv with read-level SNP/InDel evidence",
         ],
         notes: &[
@@ -729,6 +729,7 @@ struct PolishPaths {
     round1_sv_support_summary: PathBuf,
     round1_sv_high_subgroup_report: PathBuf,
     round1_plot_script: PathBuf,
+    round1_sv_bubble_plot_script: PathBuf,
     round1_snv_indel_per_variant_calls: PathBuf,
     round1_snv_indel_segments: PathBuf,
     round1_snv_indel_variant_type_annotations: PathBuf,
@@ -781,6 +782,7 @@ impl PolishPaths {
             round1_sv_support_summary: round1_sv_reports_dir.join("sv_snv_indel_summary.tsv"),
             round1_sv_high_subgroup_report: round1_sv_reports_dir.join("sv_high_subgroups.tsv"),
             round1_plot_script: round1_sv_plots_dir.join("plot_sv_support.py"),
+            round1_sv_bubble_plot_script: round1_sv_plots_dir.join("plot_sv_bubble.py"),
             round1_snv_indel_per_variant_calls: round1_snv_indel_data_dir
                 .join("snv_indel_calls.tsv"),
             round1_snv_indel_segments: round1_snv_indel_data_dir.join("snv_indel_segments.tsv"),
@@ -1215,6 +1217,19 @@ struct ReadGroupReport {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct SvCandidateEvaluation {
+    pub status: String,
+    pub fl_reads: usize,
+    pub reference_support_reads: usize,
+    pub reference_support_read_fraction: f64,
+    pub reference_support_depth_area_fraction: f64,
+    pub low_green_window_fraction: f64,
+    pub read_index_path: PathBuf,
+    pub high_subgroups_path: PathBuf,
+    pub summary_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 struct ReadRecord {
     id: String,
     sequence: String,
@@ -1340,6 +1355,109 @@ fn run_sv_eval_round1(
             .map(|read| (read.id, read.sequence))
             .collect(),
     })
+}
+
+pub(crate) fn evaluate_sv_candidate(
+    candidate: &Path,
+    reads: &Path,
+    soft_paths: &Path,
+    out_dir: &Path,
+    threads: usize,
+) -> Result<SvCandidateEvaluation, OrgraftError> {
+    if out_dir.exists() {
+        fs::remove_dir_all(out_dir)?;
+    }
+
+    let options = PolishOptions {
+        organelle: "sv_candidate".to_string(),
+        subgraph: "subgraph_001".to_string(),
+        draft: Some(candidate.to_path_buf()),
+        reference: Some(candidate.to_path_buf()),
+        reads: reads.to_path_buf(),
+        soft_paths: soft_paths.to_path_buf(),
+        out_dir: out_dir.to_path_buf(),
+        threads: threads.max(1),
+        max_rounds: 1,
+        validate_round: 2,
+        force: true,
+        per_read_variant_calls: true,
+        snv_indel_overlap_policy: SnvIndelOverlapPolicy::MarkOverlap,
+        plot_range: None,
+        plot_dpi: DEFAULT_PLOT_DPI,
+        plot_output_format: DEFAULT_PLOT_OUTPUT_FORMAT,
+        coverage_plot_rasterize: DEFAULT_COVERAGE_PLOT_RASTERIZE,
+        snv_indel_plot_rasterize: DEFAULT_SNV_INDEL_PLOT_RASTERIZE,
+        sv_plot_highlight_subgroups: Vec::new(),
+        sv_plot_highlight_read_ids: None,
+        sv_plot_highlight_min_fraction: DEFAULT_HIGHLIGHT_MIN_FRACTION,
+        sv_plot_highlight_min_reads: DEFAULT_HIGHLIGHT_MIN_READS,
+        snv_indel_plot_low_confidence: DEFAULT_SNV_INDEL_PLOT_LOW_CONFIDENCE.to_string(),
+        snv_indel_plot_low_min_reads: DEFAULT_SNV_INDEL_PLOT_LOW_MIN_READS,
+        snv_indel_plot_low_min_fraction: DEFAULT_SNV_INDEL_PLOT_LOW_MIN_FRACTION,
+        snv_indel_plot_high_risk_fraction: DEFAULT_SNV_INDEL_PLOT_HIGH_RISK_FRACTION,
+    };
+    let inputs = ResolvedInputs {
+        draft: candidate.to_path_buf(),
+        reference: candidate.to_path_buf(),
+        reads: reads.to_path_buf(),
+        soft_paths: soft_paths.to_path_buf(),
+    };
+    let mut paths = PolishPaths::new(out_dir, "sv_candidate", "subgraph_001", 2);
+    paths.input_draft = candidate.to_path_buf();
+    paths.input_reference = candidate.to_path_buf();
+    paths.input_reads = reads.to_path_buf();
+    paths.create_dirs()?;
+
+    let mut commands = Vec::new();
+    let report = run_sv_eval_round1(&options, &inputs, &paths, &mut commands)?;
+    let summary_path = report.sv_support_summary_path.clone();
+    let reference_support_depth_area_fraction =
+        read_sv_summary_f64(&summary_path, "reference_support_depth_area_fraction")?;
+    let low_green_window_fraction =
+        read_sv_summary_f64(&summary_path, "low_green_window_fraction")?;
+    let reference_support_read_fraction = if report.fl_reads == 0 {
+        0.0
+    } else {
+        report.reference_support_reads as f64 / report.fl_reads as f64
+    };
+
+    Ok(SvCandidateEvaluation {
+        status: report.sv_support_status,
+        fl_reads: report.fl_reads,
+        reference_support_reads: report.reference_support_reads,
+        reference_support_read_fraction,
+        reference_support_depth_area_fraction,
+        low_green_window_fraction,
+        read_index_path: report.read_group_ids_path,
+        high_subgroups_path: report.high_subgroup_report_path,
+        summary_path,
+    })
+}
+
+fn read_sv_summary_f64(path: &Path, metric: &str) -> Result<f64, OrgraftError> {
+    for line_result in BufReader::new(File::open(path)?).lines() {
+        let line = line_result?;
+        let mut fields = line.split('\t');
+        if fields.next() != Some(metric) {
+            continue;
+        }
+        let value = fields.next().ok_or_else(|| {
+            OrgraftError::InvalidArgument(format!(
+                "{} metric `{metric}` has no value",
+                path.display()
+            ))
+        })?;
+        return value.parse::<f64>().map_err(|error| {
+            OrgraftError::InvalidArgument(format!(
+                "{} metric `{metric}` is not numeric: {error}",
+                path.display()
+            ))
+        });
+    }
+    Err(OrgraftError::InvalidArgument(format!(
+        "{} does not contain metric `{metric}`",
+        path.display()
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -4673,6 +4791,20 @@ fn run_plot_script(
         &paths.round1_sv_plots_dir,
         commands,
     )?;
+    let mut bubble_command = Command::new(&python);
+    bubble_command
+        .arg(&paths.round1_sv_bubble_plot_script)
+        .arg("--plot-dpi")
+        .arg(options.plot_dpi.to_string())
+        .arg("--plot-output-format")
+        .arg(options.plot_output_format.as_str());
+    run_plot_command(
+        bubble_command,
+        "plot_sv_bubble",
+        paths,
+        &paths.round1_sv_plots_dir,
+        commands,
+    )?;
     if snv_indel_report.is_some() {
         let mut snv_command = Command::new(&python);
         snv_command
@@ -5832,6 +5964,8 @@ fn high_subgroup_judgement(
 fn write_plot_script(paths: &PolishPaths) -> Result<(), OrgraftError> {
     let mut file = File::create(&paths.round1_plot_script)?;
     file.write_all(PLOT_SV_SUPPORT_PY.as_bytes())?;
+    let mut file = File::create(&paths.round1_sv_bubble_plot_script)?;
+    file.write_all(PLOT_SV_BUBBLE_PY.as_bytes())?;
     let mut file = File::create(&paths.round1_snv_indel_plot_script)?;
     file.write_all(PLOT_SNV_INDEL_PY.as_bytes())?;
     Ok(())
@@ -5863,13 +5997,6 @@ def read_coverage(path: Path):
                 }
             )
     return rows
-
-
-def read_bubble(path: Path):
-    if not path.exists():
-        return []
-    with path.open() as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
 
 
 def read_group_ids(path: Path):
@@ -6071,30 +6198,6 @@ def plot_coverage(
     plt.close()
 
 
-def plot_bubble(rows, output_prefix: str, plots_dir: Path, plot_dpi: int = 300, output_format: str = "png"):
-    if not rows:
-        return
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    se1 = [int(row["se1"]) for row in rows]
-    ss2 = [int(row["ss2"]) for row in rows]
-    size = [max(float(row["subgroup_count_norm_per_10000"]) * 10.0, 1.0) for row in rows]
-    color = [row["color"] for row in rows]
-    max_coord = max(max(se1), max(ss2))
-
-    fig, ax = plt.subplots(figsize=(10, 10), dpi=plot_dpi)
-    ax.scatter(se1, ss2, s=size, c=color, alpha=0.5, linewidths=0)
-    ax.set_xlim(1, max_coord)
-    ax.set_ylim(1, max_coord)
-    ax.grid(True, alpha=0.5)
-    fig.tight_layout()
-    save_plot(fig, plots_dir, output_prefix, output_format)
-    plt.close(fig)
-
-
 def main():
     parser = argparse.ArgumentParser()
     default_plots_dir = Path(__file__).resolve().parent
@@ -6154,6 +6257,160 @@ def main():
             highlight_depth,
             f"highlight n={len(highlight_ids)}",
         )
+
+
+if __name__ == "__main__":
+    main()
+"##;
+
+const PLOT_SV_BUBBLE_PY: &str = r##"#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "orgraft_matplotlib"))
+
+
+BUBBLE_GROUPS = [
+    ("type_2_subtype_rep_NA", "bubble_type_2_rep_raw"),
+    ("type_2_subtype_ins_NA", "bubble_type_2_ins_raw"),
+]
+
+
+def read_reference_len(path: Path):
+    reference_len = 0
+    with path.open() as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            reference_len = int(row["position"])
+    if reference_len < 1:
+        raise SystemExit(f"no reference positions found in {path}")
+    return reference_len
+
+
+def count_fl_reads(path: Path):
+    with path.open() as handle:
+        return sum(1 for row in csv.DictReader(handle, delimiter="\t") if row["read_class"] == "FL")
+
+
+def parse_first_boundary(text: str):
+    fields = {}
+    for item in text.split(";", 1)[0].split(","):
+        key, value = item.split("=", 1)
+        fields[key] = int(value)
+    return fields["se1"], fields["ss2"]
+
+
+def first_overlap(text: str):
+    value = text.split(",", 1)[0].strip()
+    return float(value) if value and value != "." else 0.0
+
+
+def overlap_color(overlap: float):
+    if overlap >= 1000:
+        return "#FF00FF"
+    if overlap >= 300:
+        return "#00FF00"
+    if overlap >= 200:
+        return "#0016FF"
+    if overlap >= 100:
+        return "#E8720C"
+    if overlap >= 50:
+        return "#E6E600"
+    return "#B0B0B0"
+
+
+def circular_coordinate(value: int, reference_len: int):
+    return (value - 1) % reference_len + 1
+
+
+def read_bubbles(path: Path, group_name: str, total_fl_reads: int, reference_len: int):
+    rows = []
+    denominator = max(total_fl_reads, 1)
+    with path.open() as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if row["group_name"] != group_name:
+                continue
+            se1, ss2 = parse_first_boundary(row["boundary_key"])
+            overlap = first_overlap(row["mid_olps"])
+            normalized_count = int(row["subgroup_reads"]) / denominator * 10000.0
+            rows.append(
+                {
+                    "se1": circular_coordinate(se1, reference_len),
+                    "ss2": circular_coordinate(ss2, reference_len),
+                    "size": max(normalized_count * 10.0, 1.0),
+                    "color": overlap_color(overlap),
+                }
+            )
+    return rows
+
+
+def save_plot(fig, plots_dir: Path, stem: str, output_format: str):
+    if output_format in ("pdf", "both"):
+        fig.savefig(plots_dir / f"{stem}.pdf")
+    if output_format in ("png", "both"):
+        fig.savefig(plots_dir / f"{stem}.png")
+
+
+def plot_bubble(rows, output_prefix: str, plots_dir: Path, reference_len: int, plot_dpi: int, output_format: str):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=plot_dpi)
+    if rows:
+        ax.scatter(
+            [row["se1"] for row in rows],
+            [row["ss2"] for row in rows],
+            s=[row["size"] for row in rows],
+            c=[row["color"] for row in rows],
+            alpha=0.5,
+            linewidths=0,
+            clip_on=False,
+        )
+    ax.set_xlim(1, reference_len)
+    ax.set_ylim(1, reference_len)
+    ax.grid(True, alpha=0.5)
+    fig.tight_layout()
+    save_plot(fig, plots_dir, output_prefix, output_format)
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    default_plots_dir = Path(__file__).resolve().parent
+    parser.add_argument(
+        "--validate-dir",
+        type=Path,
+        default=None,
+        help="03.validate directory containing 01.data and 03.reports",
+    )
+    parser.add_argument("--plots-dir", type=Path, default=default_plots_dir, help="output directory")
+    parser.add_argument("--plot-dpi", type=int, default=300, help="PNG resolution [300]")
+    parser.add_argument(
+        "--plot-output-format",
+        choices=("png", "pdf", "both"),
+        default="png",
+        help="plot output format [png]",
+    )
+    args = parser.parse_args()
+
+    plots_dir = args.plots_dir
+    validate_dir = args.validate_dir or plots_dir.parent
+    data_dir = validate_dir / "01.data"
+    reports_dir = validate_dir / "03.reports"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    reference_len = read_reference_len(data_dir / "sv_coverage.tsv")
+    total_fl_reads = count_fl_reads(data_dir / "sv_read_index.tsv")
+    subgroup_stats = reports_dir / "sv_subgroup_stats.tsv"
+    for group_name, output_prefix in BUBBLE_GROUPS:
+        rows = read_bubbles(subgroup_stats, group_name, total_fl_reads, reference_len)
+        plot_bubble(rows, output_prefix, plots_dir, reference_len, args.plot_dpi, args.plot_output_format)
 
 
 if __name__ == "__main__":
@@ -7560,6 +7817,13 @@ fn write_report(
         "sv_plot_script_round_1",
         "path",
         &display_path(&paths.round1_plot_script),
+    )?;
+    write_report_row(
+        &mut file,
+        "output",
+        "sv_bubble_plot_script_round_1",
+        "path",
+        &display_path(&paths.round1_sv_bubble_plot_script),
     )?;
     write_report_row(
         &mut file,
@@ -9224,6 +9488,12 @@ mod tests {
             )
         );
         assert_eq!(
+            paths.round1_sv_bubble_plot_script,
+            PathBuf::from(
+                "results/polish/mito/subgraph_002/round_1/03.validate/02.plots/plot_sv_bubble.py"
+            )
+        );
+        assert_eq!(
             paths.round1_snv_indel_variant_type_annotations,
             PathBuf::from(
                 "results/polish/mito/subgraph_002/round_1/03.validate/01.data/snv_indel_variants.tsv"
@@ -9258,6 +9528,14 @@ mod tests {
             options.snv_indel_overlap_policy,
             SnvIndelOverlapPolicy::MarkOverlap
         );
+    }
+
+    #[test]
+    fn sv_bubble_script_defaults_to_two_png_plots() {
+        assert!(PLOT_SV_BUBBLE_PY.contains("default=\"png\""));
+        assert!(PLOT_SV_BUBBLE_PY.contains("bubble_type_2_rep_raw"));
+        assert!(PLOT_SV_BUBBLE_PY.contains("bubble_type_2_ins_raw"));
+        assert!(PLOT_SV_BUBBLE_PY.contains("sv_subgroup_stats.tsv"));
     }
 
     #[test]

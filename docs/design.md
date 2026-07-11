@@ -59,7 +59,7 @@ Workflow-generated roots are numbered for the major products:
 | `workflow checkpoint1` | `checkpoint_1.status.tsv`, `checked_draft.gfa`, optional `manual_edit_required.gfa` | Topology and GFA consistency gate before resolve |
 | `resolve` | `ORGANELLE/graph/merged_unresolved.gfa`, `merged_unresolved_subgraph_001.gfa`, `ORGANELLE/fasta/rotated_reference.fasta`, `resolved_subgraphs.fasta`, `logs/resolve_details.tsv` | Uses checked draft graph plus reference FASTA |
 | `polish` | `ORGANELLE/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}`; round 2+ leaves `02.polish` empty and validates `01.inputs/linear_subgraph.round_N.fasta` | Plot scripts require `matplotlib` |
-| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | SV failures stop for manual review; SNV/InDel correction can continue up to `max_rounds` |
+| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `sv_repair/{sv_repair.tsv,sv_candidate_scores.tsv,sv_graph_localization.tsv}`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | Localizes abnormal breakpoints on the read-only `02.unitig_graph`, repairs one subgroup at a time, and extends SV rounds up to a hard total of 10 |
 | `rebuild` | `OUT/SUBGRAPH/rebuild_SUBGRAPH.gfa`, `rebuild_SUBGRAPH.fasta`, `rebuild_SUBGRAPH_nodes.fasta`, `OUT/logs/*.tsv` | PDF/SVG export is attempted only when an image reference is supplied |
 
 ## Rebuild Outputs

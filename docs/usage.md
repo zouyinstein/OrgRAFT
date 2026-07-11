@@ -50,6 +50,7 @@ Checkpoint and correction commands:
 ```bash
 orgraft workflow checkpoint1 --config results_workflow/orgraft.workflow.toml --case mito_subgraph_001
 orgraft workflow checkpoint2 --config results_workflow/orgraft.workflow.toml --case mito_subgraph_001 --round 1
+orgraft workflow checkpoint2 --config results_workflow/orgraft.workflow.toml --case mito_subgraph_001 --round 1 --sv-subgroup type_3_subtype_rep_rep_NA:4
 orgraft workflow correct --input-fasta INPUT.fasta --pos-ref-alt pos_ref_alt.txt --out OUTPUT.fasta
 orgraft workflow test-correction --input-fasta INPUT.fasta --pos-ref-alt pos_ref_alt.txt --out-dir results_workflow/correction_test
 orgraft workflow test-fake-validate --input-fasta ERROR_POLISH_ALN.fasta --pos-ref-alt pos_ref_alt.txt --out-dir results_workflow/fake_validate --force
@@ -78,6 +79,7 @@ soft_paths = "soft_paths.txt"
 [workflow]
 mode = "stepwise"
 max_rounds = 3
+auto_sv_correction = true
 threads = 64
 force = false
 auto_snv_indel_correction = true
@@ -143,6 +145,7 @@ reads = "${results_dir}/01.recruit/${organelle}.fastq.gz"
 # linearized_fasta defaults to commands.resolve.out_dir/${organelle}/fasta/resolved_subgraphs.fasta
 # polish_reference defaults to commands.resolve.out_dir/${organelle}/fasta/rotated_reference.fasta
 # polish_out_dir defaults to commands.polish.out_dir
+# sv_correction_subgroup = "type_3_subtype_rep_rep_NA:4"
 rebuild_out_dir = "${results_dir}/05.rebuild/${organelle}"
 ```
 
@@ -193,9 +196,27 @@ checkpoint as checked. If the graph is complex or inconsistent, it writes a
 manual-edit copy and stops.
 
 Checkpoint 2 reads polish validation evidence. If SV support fails, it stops
-for manual inspection. If SV passes and SNV/InDel rows require correction, it
-writes the next-round polish input until `max_rounds` is reached. If both SV
-and SNV/InDel validation pass, the case is complete.
+for manual inspection unless `sv_high_subgroups.tsv` contains an automatically
+repairable `possible_reference_sv_error`. It repairs one subgroup at a time,
+requires most selected reads to become `type_1`, and accepts a candidate only
+when `low_green_window_fraction` improves without reducing global reference
+support. Set case-level `sv_correction_subgroup = "group_name:old_index"` or
+pass `--sv-subgroup` to choose the subgroup manually.
+
+Before changing sequence, SV check projects subgroup breakpoints back to
+`02.anchor_graph_core/02.unitig_graph/graph.gfa` and writes
+`sv_repair/sv_graph_localization.tsv`. It distinguishes breakpoints inside one
+`S` record (split the unitig before editing links) from missing or competing
+connections between unitig ends. The graph path is derived automatically;
+set case-level `unitig_graph = "/path/to/02.unitig_graph/graph.gfa"` only for a
+nonstandard layout. Projection is advisory and never modifies the GFA.
+
+An accepted SV repair adds one full-read validation round without consuming
+the ordinary `max_rounds` budget. For example, one SV repair changes the
+default maximum actual round from 3 to 4. Multiple SV repairs may extend it,
+but the hard total is 10. Once no repairable SV subgroup remains, checkpoint 2
+applies SNV/InDel correction under the ordinary budget. If both validations
+pass, the case is complete.
 
 ## Generated Layout
 
@@ -215,6 +236,12 @@ results_workflow/
         02.polish/
           polished_aln.fasta
         03.validate/
+          01.data/
+          02.plots/
+            plot_sv_bubble.py
+            bubble_type_2_rep_raw.png
+            bubble_type_2_ins_raw.png
+          03.reports/
       round_2/
         01.inputs/
           linear_subgraph.round_2.fasta

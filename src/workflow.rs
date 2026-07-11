@@ -7,7 +7,10 @@ use std::process::Command;
 
 use crate::commands;
 use crate::error::OrgraftError;
+use crate::sv_repair::{repair_sv_subgroup, select_sv_subgroup_spec, SvRepairRequest};
 use crate::topology::{analyze_gfa, nodes_tsv, summary_tsv, TopologyReport};
+
+const WORKFLOW_HARD_MAX_ROUNDS: usize = 10;
 
 const HELP: &str = r#"orgraft workflow
 
@@ -33,7 +36,7 @@ Workflow commands:
 
 Checkpoint/test commands:
   checkpoint1         check topology and write checked_draft.gfa when simple
-  checkpoint2         check SV/SNV-InDel evidence and prepare next polish round
+  checkpoint2         localize/check SV and prepare the next correction round
   correct             apply pos/ref/alt table to one FASTA record
   test-correction     smoke test FASTA correction with explicit inputs
   test-fake-validate  simulate validate failure from swapped polish_aln FASTA
@@ -42,12 +45,13 @@ Common options:
   --config FILE       workflow config [orgraft.workflow.toml]
   --case NAME         select one workflow.case section
   --round N           checkpoint2 validation/correction round [1]
+  --sv-subgroup SPEC  manually repair one group_name:old_index at checkpoint2
   --force             overwrite generated checkpoint/correction outputs
 
 The workflow layer is intentionally thin: resolve/polish/rebuild own their core
 algorithms; workflow owns config parsing, project layout, run-command generation,
-manual checkpoint status, and at most max_rounds automatic SNV/InDel correction
-rounds.
+manual checkpoint status, max_rounds ordinary validation/correction rounds, and
+extra SV-repair rounds up to a hard total of 10.
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +97,7 @@ struct WorkflowConfig {
     max_rounds: usize,
     threads: usize,
     force: bool,
+    auto_sv_correction: bool,
     auto_snv_indel_correction: bool,
     recruit: WorkflowRecruitConfig,
     asm: WorkflowAsmConfig,
@@ -111,6 +116,7 @@ struct WorkflowCase {
     organelle: String,
     subgraph: String,
     draft_graph: PathBuf,
+    unitig_graph: Option<PathBuf>,
     checked_draft_gfa: PathBuf,
     reference: Option<PathBuf>,
     pre_rotated_reference: Option<PathBuf>,
@@ -125,6 +131,7 @@ struct WorkflowCase {
     workflow_dir: PathBuf,
     linearized_fasta: Option<PathBuf>,
     polish_reference: Option<PathBuf>,
+    sv_correction_subgroup: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +351,9 @@ soft_paths = {soft_paths}
 # automatic: `orgraft workflow run` may execute resolve/polish rounds directly.
 mode = "stepwise"
 max_rounds = 3
+# An accepted SV repair adds one actual validation round without consuming the
+# max_rounds budget. Total actual rounds are always capped at 10.
+auto_sv_correction = true
 # Fallback when a command-specific threads value is omitted.
 threads = 64
 force = false
@@ -440,6 +450,9 @@ workflow_dir = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}"
 # Checkpoint 1 consumes the draft graph and writes checked_draft_gfa only when
 # topology is simple and all GFA links reference declared segment records.
 draft_graph = "${{results_dir}}/02.draft_asm/${{organelle}}/03.finalize_graph/graph.gfa"
+# Optional override used only by SV check to project breakpoints back to the
+# original unitig graph; the default is derived from commands.asm.out_dir.
+# unitig_graph = "${{results_dir}}/02.draft_asm/${{organelle}}/02.anchor_graph_core/02.unitig_graph/graph.gfa"
 checked_draft_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
 
 # Resolve uses the matching FASTA from commands.recruit.baits when reference is omitted.
@@ -455,6 +468,9 @@ reads = "${{results_dir}}/01.recruit/${{organelle}}.fastq.gz"
 # polish_reference = "${{results_dir}}/03.resolve_gfa/${{organelle}}/fasta/rotated_reference.fasta"
 # polish_out_dir defaults to commands.polish.out_dir.
 # polish_out_dir = "${{results_dir}}/04.polish"
+# Optional manual override for checkpoint2 SV repair. The automatic mode only
+# selects `possible_reference_sv_error` rows whose local type_1 support is weak.
+# sv_correction_subgroup = "type_3_subtype_rep_rep_NA:4"
 
 rebuild_out_dir = "${{results_dir}}/05.rebuild/${{organelle}}"
 rebuild_edited_gfa = "${{results_dir}}/workflow/${{organelle}}/${{subgraph}}/checkpoint_1/checked_draft.gfa"
@@ -575,7 +591,8 @@ fn run_checkpoint2(args: &[String]) -> Result<(), OrgraftError> {
     let round = parse_round(args)?;
     let force = config.force || has_flag(args, "--force");
     let run_next = has_flag(args, "--run-next");
-    let status = checkpoint2_impl(&config, case, round, force, run_next)?;
+    let manual_sv_subgroup = option_value(args, "--sv-subgroup")?;
+    let status = checkpoint2_impl(&config, case, round, force, run_next, manual_sv_subgroup)?;
     match status {
         Checkpoint2Status::Complete => println!("checkpoint2 complete at round {round}"),
         Checkpoint2Status::NextRoundReady => println!(
@@ -684,6 +701,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
         max_rounds: 3,
         threads: 1,
         force: true,
+        auto_sv_correction: false,
         auto_snv_indel_correction: true,
         recruit: WorkflowRecruitConfig {
             enabled: false,
@@ -780,6 +798,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
             organelle: organelle.to_string(),
             subgraph: subgraph.to_string(),
             draft_graph: out_dir.join("draft.gfa"),
+            unitig_graph: None,
             checked_draft_gfa: out_dir
                 .join("workflow")
                 .join(organelle)
@@ -798,6 +817,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
             workflow_dir: out_dir.join("workflow").join(organelle).join(subgraph),
             linearized_fasta: None,
             polish_reference: None,
+            sv_correction_subgroup: None,
         }],
     };
     write_with_parent(
@@ -818,7 +838,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
     write_fake_sv_pass_summary(&sv_summary_path(case, 1))?;
     write_fake_snv_high_table(&snv_indel_high_path(case, 1), &edits)?;
 
-    let round1_status = checkpoint2_impl(&config, case, 1, true, false)?;
+    let round1_status = checkpoint2_impl(&config, case, 1, true, false, None)?;
     if round1_status != Checkpoint2Status::NextRoundReady {
         return Err(OrgraftError::InvalidArgument(format!(
             "fake round_1 expected next_round_ready, got {round1_status:?}"
@@ -830,7 +850,7 @@ fn run_test_fake_validate(args: &[String]) -> Result<(), OrgraftError> {
     write_fake_sv_pass_summary(&sv_summary_path(case, 2))?;
     write_fake_snv_high_table(&snv_indel_high_path(case, 2), &[])?;
 
-    let round2_status = checkpoint2_impl(&config, case, 2, true, false)?;
+    let round2_status = checkpoint2_impl(&config, case, 2, true, false, None)?;
     if round2_status != Checkpoint2Status::Complete {
         return Err(OrgraftError::InvalidArgument(format!(
             "fake round_2 expected complete, got {round2_status:?}"
@@ -861,8 +881,8 @@ fn run_automatic_workflow(args: &[String]) -> Result<(), OrgraftError> {
     run_resolve_for_case(&config, case, force)?;
     run_polish_round(&config, case, 1, &round_draft_path(case, 1), force)?;
 
-    for round in 1..=config.max_rounds {
-        match checkpoint2_impl(&config, case, round, force, false)? {
+    for round in 1..=WORKFLOW_HARD_MAX_ROUNDS {
+        match checkpoint2_impl(&config, case, round, force, false, None)? {
             Checkpoint2Status::Complete => {
                 if config.rebuild.enabled {
                     commands::rebuild::run(&rebuild_args_with_polished(
@@ -877,7 +897,7 @@ fn run_automatic_workflow(args: &[String]) -> Result<(), OrgraftError> {
             Checkpoint2Status::ManualRequired => return Ok(()),
             Checkpoint2Status::NextRoundReady => {
                 let next_round = round + 1;
-                if next_round > config.max_rounds {
+                if next_round > WORKFLOW_HARD_MAX_ROUNDS {
                     return Ok(());
                 }
                 let draft = corrected_fasta_path(case, round);
@@ -946,6 +966,7 @@ fn checkpoint2_impl(
     round: usize,
     force: bool,
     run_next: bool,
+    manual_sv_subgroup: Option<&str>,
 ) -> Result<Checkpoint2Status, OrgraftError> {
     if round == 0 {
         return Err(OrgraftError::InvalidArgument(
@@ -962,6 +983,183 @@ fn checkpoint2_impl(
     let high_path = snv_indel_high_path(case, round);
     let polished_aln = polished_aln_path(case, round);
     let sv_status = read_metric_value(&summary_path, "status")?;
+    let requested_sv_subgroup = manual_sv_subgroup.or(case.sv_correction_subgroup.as_deref());
+    let configured_sv_subgroup = match requested_sv_subgroup {
+        Some(spec) if sv_subgroup_already_corrected(case, round, spec)? => None,
+        other => other,
+    };
+
+    if config.auto_sv_correction || configured_sv_subgroup.is_some() {
+        let sv_high_path = sv_high_subgroups_path(case, round);
+        let selected_sv_spec = if sv_high_path.exists() {
+            select_sv_subgroup_spec(&sv_high_path, configured_sv_subgroup)?
+        } else {
+            None
+        };
+        if let Some(selected_spec) = selected_sv_spec {
+            if round >= WORKFLOW_HARD_MAX_ROUNDS {
+                write_checkpoint2_status(
+                    &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                    "manual_required",
+                    "SV correction is still required, but the hard total of 10 validation rounds has been reached",
+                    round,
+                    &summary_path,
+                    &high_path,
+                    None,
+                    None,
+                )?;
+                append_checkpoint2_metrics(
+                    &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                    &[
+                        ("correction_kind", "sv".to_string()),
+                        ("sv_subgroup", selected_spec),
+                        ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+                    ],
+                )?;
+                return Ok(Checkpoint2Status::ManualRequired);
+            }
+
+            let corrected = corrected_fasta_path(case, round);
+            if corrected.exists() && !force {
+                return Err(OrgraftError::InvalidArgument(format!(
+                    "{} already exists; pass --force to overwrite",
+                    corrected.display()
+                )));
+            }
+            let prior_fastas = checkpoint_history_fastas(case, round);
+            let repair_dir = checkpoint_dir.join("sv_repair");
+            let unitig_graph = discover_unitig_graph(config, case);
+            let repair = repair_sv_subgroup(&SvRepairRequest {
+                reference: &polished_aln,
+                reads: &case.reads,
+                soft_paths: &config.soft_paths,
+                summary: &summary_path,
+                high_subgroups: &sv_high_path,
+                segments: &snv_indel_segments_path(case, round),
+                read_index: &sv_read_index_path(case, round),
+                unitig_graph: unitig_graph.as_deref(),
+                output_dir: &repair_dir,
+                manual_subgroup: Some(&selected_spec),
+                threads: polish_threads(config).min(8),
+                prior_fastas: &prior_fastas,
+                max_candidate_evaluations: None,
+            })?;
+
+            let Some(repair) = repair else {
+                let repair_report = repair_dir.join("sv_repair.tsv");
+                write_checkpoint2_status(
+                    &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                    "manual_required",
+                    "SV subgroup is abnormal, but no candidate both fixed it and improved global reference support",
+                    round,
+                    &summary_path,
+                    &high_path,
+                    None,
+                    None,
+                )?;
+                append_checkpoint2_metrics(
+                    &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                    &[
+                        ("correction_kind", "sv".to_string()),
+                        ("sv_subgroup", selected_spec),
+                        ("sv_repair_report", repair_report.display().to_string()),
+                        (
+                            "sv_graph_localization",
+                            repair_dir
+                                .join("sv_graph_localization.tsv")
+                                .display()
+                                .to_string(),
+                        ),
+                    ],
+                )?;
+                write_next_round_script(
+                    &checkpoint_dir.join("next_round.sh"),
+                    config,
+                    case,
+                    round + 1,
+                    None,
+                    Some("SV candidate search requires manual review"),
+                )?;
+                return Ok(Checkpoint2Status::ManualRequired);
+            };
+
+            copy_with_parent(&repair.corrected_fasta, &corrected, force)?;
+            let sv_corrections = sv_correction_count(case, round)? + 1;
+            let effective_max_round =
+                (config.max_rounds + sv_corrections).min(WORKFLOW_HARD_MAX_ROUNDS);
+            write_checkpoint2_status(
+                &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                "next_round_ready",
+                "one abnormal SV subgroup was corrected and validated; continue with all reads without consuming the ordinary max_rounds budget",
+                round,
+                &summary_path,
+                &high_path,
+                None,
+                Some(&corrected),
+            )?;
+            append_checkpoint2_metrics(
+                &checkpoint_dir.join("checkpoint_2.status.tsv"),
+                &[
+                    ("correction_kind", "sv".to_string()),
+                    ("sv_subgroup", repair.subgroup_spec.clone()),
+                    (
+                        "sv_repair_report",
+                        repair.repair_report.display().to_string(),
+                    ),
+                    (
+                        "sv_candidate_scores",
+                        repair.score_table.display().to_string(),
+                    ),
+                    (
+                        "sv_graph_localization",
+                        repair.graph_localization.report.display().to_string(),
+                    ),
+                    (
+                        "sv_graph_problem_scope",
+                        repair.graph_localization.problem_scope.clone(),
+                    ),
+                    (
+                        "sv_graph_suspect_segments",
+                        if repair.graph_localization.suspect_segments.is_empty() {
+                            ".".to_string()
+                        } else {
+                            repair.graph_localization.suspect_segments.join(",")
+                        },
+                    ),
+                    ("sv_candidate_count", repair.candidate_count.to_string()),
+                    (
+                        "sv_evaluated_candidates",
+                        repair.evaluated_candidates.to_string(),
+                    ),
+                    ("sv_target_reads", repair.target_reads.to_string()),
+                    (
+                        "sv_target_type1_reads",
+                        repair.target_type1_reads.to_string(),
+                    ),
+                    (
+                        "sv_after_low_green_window_fraction",
+                        format!("{:.6}", repair.evaluation.low_green_window_fraction),
+                    ),
+                    ("sv_correction_count", sv_corrections.to_string()),
+                    ("ordinary_max_rounds", config.max_rounds.to_string()),
+                    ("effective_max_round", effective_max_round.to_string()),
+                    ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+                ],
+            )?;
+            write_next_round_script(
+                &checkpoint_dir.join("next_round.sh"),
+                config,
+                case,
+                round + 1,
+                Some(&corrected),
+                None,
+            )?;
+            if run_next {
+                run_polish_round(config, case, round + 1, &corrected, force)?;
+            }
+            return Ok(Checkpoint2Status::NextRoundReady);
+        }
+    }
 
     if sv_status.as_deref() != Some("pass") {
         write_checkpoint2_status(
@@ -1014,13 +1212,15 @@ fn checkpoint2_impl(
         return Ok(Checkpoint2Status::Complete);
     }
 
-    if round >= config.max_rounds {
+    let sv_corrections = sv_correction_count(case, round)?;
+    let ordinary_round = round.saturating_sub(sv_corrections);
+    if ordinary_round >= config.max_rounds || round >= WORKFLOW_HARD_MAX_ROUNDS {
         let pos_ref_alt = checkpoint_dir.join("pos_ref_alt.txt");
         write_pos_ref_alt(&pos_ref_alt, &edits)?;
         write_checkpoint2_status(
             &checkpoint_dir.join("checkpoint_2.status.tsv"),
             "manual_required",
-            "SNV/InDel still fails after max_rounds; manually analyze or increase max_rounds",
+            "SNV/InDel still fails after the ordinary max_rounds budget or the hard total of 10 rounds",
             round,
             &summary_path,
             &high_path,
@@ -1033,7 +1233,17 @@ fn checkpoint2_impl(
             case,
             round + 1,
             None,
-            Some("max_rounds reached; increase max_rounds before continuing"),
+            Some("ordinary max_rounds or hard total round limit reached"),
+        )?;
+        append_checkpoint2_metrics(
+            &checkpoint_dir.join("checkpoint_2.status.tsv"),
+            &[
+                ("correction_kind", "snv_indel".to_string()),
+                ("sv_correction_count", sv_corrections.to_string()),
+                ("ordinary_round", ordinary_round.to_string()),
+                ("ordinary_max_rounds", config.max_rounds.to_string()),
+                ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+            ],
         )?;
         return Ok(Checkpoint2Status::ManualRequired);
     }
@@ -1057,6 +1267,16 @@ fn checkpoint2_impl(
         &high_path,
         Some(&pos_ref_alt),
         Some(&corrected),
+    )?;
+    append_checkpoint2_metrics(
+        &checkpoint_dir.join("checkpoint_2.status.tsv"),
+        &[
+            ("correction_kind", "snv_indel".to_string()),
+            ("sv_correction_count", sv_corrections.to_string()),
+            ("ordinary_round", ordinary_round.to_string()),
+            ("ordinary_max_rounds", config.max_rounds.to_string()),
+            ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+        ],
     )?;
     write_next_round_script(
         &checkpoint_dir.join("next_round.sh"),
@@ -1245,10 +1465,10 @@ fn write_plan_script(
         &mut script,
         "",
         "04.polish_checkpoint2",
-        "polish, validate SV/SNV-InDel evidence, and advance correction rounds",
+        "polish, localize/validate SV evidence, and advance correction rounds",
     );
 
-    for round in 1..=config.max_rounds {
+    for round in 1..=WORKFLOW_HARD_MAX_ROUNDS {
         let draft = round_draft_path(case, round);
         writeln!(script, "if [[ -z \"$final_polished\" ]]; then").unwrap();
         writeln!(script, "  # 04.polish round {round}").unwrap();
@@ -1295,7 +1515,7 @@ fn write_plan_script(
         .unwrap();
         writeln!(script, "      ;;").unwrap();
         writeln!(script, "    next_round_ready)").unwrap();
-        if round < config.max_rounds {
+        if round < WORKFLOW_HARD_MAX_ROUNDS {
             writeln!(
                 script,
                 "      echo \"checkpoint2 round {round} ready; continuing to round {}\"",
@@ -1306,8 +1526,8 @@ fn write_plan_script(
         } else {
             writeln!(
                 script,
-                "      echo \"checkpoint2 round {round} requested another round, but max_rounds={} has been reached\"",
-                config.max_rounds
+                "      echo \"checkpoint2 round {round} requested another round, but the hard total of {} rounds has been reached\"",
+                WORKFLOW_HARD_MAX_ROUNDS
             )
             .unwrap();
             writeln!(script, "      exit 0").unwrap();
@@ -2298,6 +2518,7 @@ impl WorkflowConfig {
         let max_rounds = parse_config_usize(workflow, "max_rounds", 3)?.max(1);
         let threads = parse_config_usize(workflow, "threads", 64)?.max(1);
         let force = parse_config_bool(workflow, "force", false)?;
+        let auto_sv_correction = parse_config_bool(workflow, "auto_sv_correction", true)?;
         let auto_snv_indel_correction =
             parse_config_bool(workflow, "auto_snv_indel_correction", true)?;
         let topology_simple_allowed_classes = workflow
@@ -2378,6 +2599,7 @@ impl WorkflowConfig {
             max_rounds,
             threads,
             force,
+            auto_sv_correction,
             auto_snv_indel_correction,
             recruit,
             asm,
@@ -2444,6 +2666,7 @@ impl WorkflowCase {
             "draft_graph",
             "${results_dir}/02.draft_asm/${organelle}/03.finalize_graph/graph.gfa".to_string(),
         );
+        let unitig_graph = optional_path("unitig_graph");
         let checked_draft_gfa = path_or(
             "checked_draft_gfa",
             "${results_dir}/workflow/${organelle}/${subgraph}/checkpoint_1/checked_draft.gfa"
@@ -2470,6 +2693,7 @@ impl WorkflowCase {
         let pre_rotated_reference = optional_path("pre_rotated_reference");
         let linearized_fasta = optional_path("linearized_fasta");
         let polish_reference = optional_path("polish_reference");
+        let sv_correction_subgroup = section.get("sv_correction_subgroup").cloned();
 
         Ok(Self {
             enabled,
@@ -2478,6 +2702,7 @@ impl WorkflowCase {
             organelle,
             subgraph,
             draft_graph,
+            unitig_graph,
             checked_draft_gfa,
             reference,
             pre_rotated_reference,
@@ -2492,6 +2717,7 @@ impl WorkflowCase {
             workflow_dir,
             linearized_fasta,
             polish_reference,
+            sv_correction_subgroup,
         })
     }
 }
@@ -3293,7 +3519,7 @@ fn runtime_stage_rows(config: &WorkflowConfig) -> Result<Vec<RuntimeStageRow>, O
             source: resolve_details.display().to_string(),
         });
 
-        for round in 1..=config.max_rounds {
+        for round in 1..=WORKFLOW_HARD_MAX_ROUNDS {
             let polish_report = polish_report_path(case, round);
             if polish_report.exists() {
                 rows.push(RuntimeStageRow {
@@ -3411,11 +3637,11 @@ fn write_runtime_fake_validate(
 }
 
 fn latest_checkpoint2_status(
-    config: &WorkflowConfig,
+    _config: &WorkflowConfig,
     case: &WorkflowCase,
 ) -> Result<String, OrgraftError> {
     let mut statuses = Vec::new();
-    for round in 1..=config.max_rounds {
+    for round in 1..=WORKFLOW_HARD_MAX_ROUNDS {
         let path = case
             .workflow_dir
             .join("checkpoint_2")
@@ -3644,6 +3870,76 @@ fn write_checkpoint2_status(
         push_metric(&mut out, "corrected_fasta", &path.display().to_string());
     }
     write_with_parent(path, &out)
+}
+
+fn append_checkpoint2_metrics(path: &Path, metrics: &[(&str, String)]) -> Result<(), OrgraftError> {
+    let mut output = fs::read_to_string(path)?;
+    for (key, value) in metrics {
+        push_metric(&mut output, key, value);
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn sv_correction_count(case: &WorkflowCase, before_round: usize) -> Result<usize, OrgraftError> {
+    let mut count = 0usize;
+    for round in 1..before_round {
+        let status_path = case
+            .workflow_dir
+            .join("checkpoint_2")
+            .join(format!("round_{round}"))
+            .join("checkpoint_2.status.tsv");
+        if read_metric_value(&status_path, "correction_kind")?.as_deref() == Some("sv") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn sv_subgroup_already_corrected(
+    case: &WorkflowCase,
+    before_round: usize,
+    requested: &str,
+) -> Result<bool, OrgraftError> {
+    let requested = canonical_sv_subgroup_spec(requested);
+    for round in 1..before_round {
+        let status_path = case
+            .workflow_dir
+            .join("checkpoint_2")
+            .join(format!("round_{round}"))
+            .join("checkpoint_2.status.tsv");
+        if read_metric_value(&status_path, "correction_kind")?.as_deref() != Some("sv") {
+            continue;
+        }
+        if read_metric_value(&status_path, "sv_subgroup")?
+            .as_deref()
+            .is_some_and(|value| canonical_sv_subgroup_spec(value) == requested)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn canonical_sv_subgroup_spec(value: &str) -> String {
+    let Some((group, index)) = value.rsplit_once(':') else {
+        return value.to_string();
+    };
+    format!(
+        "{}:{}",
+        group.replace("_subtype_", "_").trim_end_matches("_NA"),
+        index
+    )
+}
+
+fn checkpoint_history_fastas(case: &WorkflowCase, round: usize) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for previous_round in 1..round {
+        paths.push(polished_aln_path(case, previous_round));
+        paths.push(corrected_fasta_path(case, previous_round));
+    }
+    paths.push(polished_aln_path(case, round));
+    paths
 }
 
 fn read_metric_value(path: &Path, metric: &str) -> Result<Option<String>, OrgraftError> {
@@ -4043,6 +4339,29 @@ fn write_fasta(path: &Path, header: &str, sequence: &str) -> Result<(), OrgraftE
     write_with_parent(path, &out)
 }
 
+fn discover_unitig_graph(config: &WorkflowConfig, case: &WorkflowCase) -> Option<PathBuf> {
+    if let Some(path) = &case.unitig_graph {
+        return Some(path.clone());
+    }
+    let asm_path = config
+        .asm
+        .out_dir
+        .join(&case.organelle)
+        .join("02.anchor_graph_core/02.unitig_graph/graph.gfa");
+    let draft_relative = case
+        .draft_graph
+        .parent()
+        .and_then(Path::parent)
+        .map(|organelle_dir| organelle_dir.join("02.anchor_graph_core/02.unitig_graph/graph.gfa"));
+    if asm_path.exists() {
+        Some(asm_path)
+    } else if draft_relative.as_ref().is_some_and(|path| path.exists()) {
+        draft_relative
+    } else {
+        Some(asm_path)
+    }
+}
+
 fn round_draft_path(case: &WorkflowCase, round: usize) -> PathBuf {
     if round == 1 {
         case.linearized_fasta
@@ -4086,6 +4405,18 @@ fn sv_summary_path(case: &WorkflowCase, round: usize) -> PathBuf {
 
 fn snv_indel_high_path(case: &WorkflowCase, round: usize) -> PathBuf {
     polish_round_dir(case, round).join("03.validate/03.reports/snv_indel_high.tsv")
+}
+
+fn sv_high_subgroups_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round).join("03.validate/03.reports/sv_high_subgroups.tsv")
+}
+
+fn snv_indel_segments_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round).join("03.validate/01.data/snv_indel_segments.tsv")
+}
+
+fn sv_read_index_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round).join("03.validate/01.data/sv_read_index.tsv")
 }
 
 fn polished_aln_path(case: &WorkflowCase, round: usize) -> PathBuf {
@@ -4379,6 +4710,10 @@ mod tests {
         assert!(template.contains("organelle = \"mito\""));
         assert!(template.contains("organelle = \"plastid\""));
         assert!(template.contains("max_rounds = 3"));
+        assert!(template.contains("auto_sv_correction = true"));
+        assert!(template.contains("capped at 10"));
+        assert!(template.contains("sv_correction_subgroup = \"type_3_subtype_rep_rep_NA:4\""));
+        assert!(template.contains("unitig_graph = \"${results_dir}/02.draft_asm/${organelle}/02.anchor_graph_core/02.unitig_graph/graph.gfa\""));
         assert!(!template.contains("command_mode"));
         assert!(template.contains("auto_snv_indel_correction = true"));
         assert!(template.contains(
@@ -4435,6 +4770,8 @@ name = "mito_subgraph_001"
 organelle = "mito"
 subgraph = "subgraph_001"
 draft_graph = "${results_dir}/draft/${organelle}.gfa"
+unitig_graph = "${results_dir}/draft/${organelle}.unitig.gfa"
+sv_correction_subgroup = "type_3_rep_rep:4"
 "#,
         )
         .unwrap();
@@ -4442,9 +4779,18 @@ draft_graph = "${results_dir}/draft/${organelle}.gfa"
         let config = WorkflowConfig::from_path(&config_path).unwrap();
         assert_eq!(config.sample, "S1");
         assert_eq!(config.max_rounds, 2);
+        assert!(config.auto_sv_correction);
+        assert_eq!(
+            config.cases[0].sv_correction_subgroup.as_deref(),
+            Some("type_3_rep_rep:4")
+        );
         assert_eq!(
             config.cases[0].draft_graph,
             PathBuf::from("results_workflow/draft/mito.gfa")
+        );
+        assert_eq!(
+            config.cases[0].unitig_graph,
+            Some(PathBuf::from("results_workflow/draft/mito.unitig.gfa"))
         );
         assert_eq!(
             config.cases[0].checked_draft_gfa,
@@ -4540,6 +4886,7 @@ reference = "mito.fa"
         assert!(!script.contains("/04.polish/round_1/"));
         assert!(!script.contains("/04.polish/round_2/"));
         assert!(script.contains("--validate-round 2"));
+        assert!(script.contains("--validate-round 10"));
         assert!(script.contains("workflow complete at checkpoint2 round 1"));
     }
 
@@ -5007,7 +5354,7 @@ name = "mito_subgraph_001"
         )
         .unwrap();
 
-        let status = checkpoint2_impl(&config, case, 1, true, false).unwrap();
+        let status = checkpoint2_impl(&config, case, 1, true, false, None).unwrap();
         assert_eq!(status, Checkpoint2Status::Complete);
         assert!(!corrected_fasta_path(case, 1).exists());
     }
@@ -5044,7 +5391,7 @@ name = "mito_subgraph_001"
         )
         .unwrap();
 
-        let status = checkpoint2_impl(&config, case, 1, true, false).unwrap();
+        let status = checkpoint2_impl(&config, case, 1, true, false, None).unwrap();
         assert_eq!(status, Checkpoint2Status::Complete);
         assert!(!corrected_fasta_path(case, 1).exists());
     }

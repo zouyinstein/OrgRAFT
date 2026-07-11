@@ -68,7 +68,12 @@ recruit -> asm -> checkpoint1 -> resolve -> polish/checkpoint2 -> rebuild
 
 The workflow layer stays thin: core algorithms remain in the individual
 commands, while workflow owns project layout, command generation, manual
-checkpoint status, and bounded SNV/InDel correction rounds.
+checkpoint status, one-at-a-time read-backed SV repair, and bounded SNV/InDel
+correction rounds. SV check also projects abnormal breakpoints onto the
+read-only `02.unitig_graph/graph.gfa` so manual review can distinguish an
+internal unitig split from a link-level problem. Accepted SV repairs add a
+validation round without consuming the ordinary round budget; total validation
+rounds are capped at 10.
 
 ## Runtime Dependencies
 
