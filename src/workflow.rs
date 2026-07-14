@@ -7,7 +7,10 @@ use std::process::Command;
 
 use crate::commands;
 use crate::error::OrgraftError;
-use crate::sv_repair::{repair_sv_subgroup, select_sv_subgroup_spec, SvRepairRequest};
+use crate::sv_repair::{
+    detect_repeat_pairing_mismatch, repair_sv_subgroup, select_sv_subgroup_spec,
+    write_repeat_pairing_mismatch_report, RepeatPairingMismatch, SvRepairRequest,
+};
 use crate::topology::{analyze_gfa, nodes_tsv, summary_tsv, TopologyReport};
 
 const WORKFLOW_HARD_MAX_ROUNDS: usize = 10;
@@ -241,6 +244,7 @@ enum Checkpoint1Status {
 enum Checkpoint2Status {
     Complete,
     NextRoundReady,
+    RebuildReady,
     ManualRequired,
 }
 
@@ -249,6 +253,16 @@ struct VariantEdit {
     pos: usize,
     reference: String,
     alternate: String,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatPairingMarker {
+    state: String,
+    repeat_node: String,
+    source_round: usize,
+    mismatch_report: PathBuf,
+    rebuild_fasta: Option<PathBuf>,
+    validation_round: Option<usize>,
 }
 
 pub fn run(args: &[String]) -> Result<(), OrgraftError> {
@@ -425,8 +439,8 @@ enabled = true
 out_dir = "${{results_dir}}/05.rebuild"
 threads = 16
 # The generated workflow script passes the final checkpoint2 polished FASTA to
-# rebuild automatically. Set edited_gfa/polished_fasta only for standalone
-# rebuild overrides.
+# rebuild automatically, together with the case reads used for real repeat-path
+# support. Set edited_gfa/polished_fasta only for standalone rebuild overrides.
 # image_reference_fasta enables optional PDF/SVG export through GFA_Editor; export
 # failures are recorded in the rebuild run report and do not fail core GFA/FASTA output.
 # merged_gfa_template = "${{results_dir}}/03.resolve_gfa/mito/graph/merged_unresolved.gfa"
@@ -598,6 +612,10 @@ fn run_checkpoint2(args: &[String]) -> Result<(), OrgraftError> {
         Checkpoint2Status::NextRoundReady => println!(
             "checkpoint2 next_round_ready: {}",
             corrected_fasta_path(case, round).display()
+        ),
+        Checkpoint2Status::RebuildReady => println!(
+            "checkpoint2 rebuild_ready: constrain repeat during rebuild, then validate {}",
+            rebuild_fasta_path(case).display()
         ),
         Checkpoint2Status::ManualRequired => {
             println!("checkpoint2 manual_required at round {round}");
@@ -885,12 +903,25 @@ fn run_automatic_workflow(args: &[String]) -> Result<(), OrgraftError> {
         match checkpoint2_impl(&config, case, round, force, false, None)? {
             Checkpoint2Status::Complete => {
                 if config.rebuild.enabled {
-                    commands::rebuild::run(&rebuild_args_with_polished(
-                        &config,
-                        case,
-                        force,
-                        Some(&polished_aln_path(case, round)),
-                    )?)?;
+                    let final_fasta = polished_aln_path(case, round);
+                    let marker = read_repeat_pairing_marker(case)?;
+                    let repeat_node = marker
+                        .as_ref()
+                        .filter(|marker| marker.state == "validated")
+                        .map(|marker| marker.repeat_node.as_str());
+                    let rebuild_fasta = rebuild_fasta_path(case);
+                    let already_current = repeat_node.is_some()
+                        && rebuild_fasta.is_file()
+                        && files_equal(&final_fasta, &rebuild_fasta)?;
+                    if !already_current {
+                        commands::rebuild::run(&rebuild_args_with_polished(
+                            &config,
+                            case,
+                            force || rebuild_fasta.exists(),
+                            Some(&final_fasta),
+                            repeat_node,
+                        )?)?;
+                    }
                 }
                 return Ok(());
             }
@@ -902,6 +933,22 @@ fn run_automatic_workflow(args: &[String]) -> Result<(), OrgraftError> {
                 }
                 let draft = corrected_fasta_path(case, round);
                 run_polish_round(&config, case, next_round, &draft, force)?;
+            }
+            Checkpoint2Status::RebuildReady => {
+                let marker = read_repeat_pairing_marker(case)?.ok_or_else(|| {
+                    OrgraftError::InvalidArgument(
+                        "checkpoint2 returned rebuild_ready without a repeat pairing marker"
+                            .to_string(),
+                    )
+                })?;
+                run_repeat_rebuild_then_validate(
+                    &config,
+                    case,
+                    round,
+                    &polished_aln_path(case, round),
+                    &marker,
+                    force,
+                )?;
             }
         }
     }
@@ -977,6 +1024,9 @@ fn checkpoint2_impl(
         .workflow_dir
         .join("checkpoint_2")
         .join(format!("round_{round}"));
+    if force && checkpoint_dir.exists() {
+        fs::remove_dir_all(&checkpoint_dir)?;
+    }
     fs::create_dir_all(&checkpoint_dir)?;
 
     let summary_path = sv_summary_path(case, round);
@@ -989,7 +1039,89 @@ fn checkpoint2_impl(
         other => other,
     };
 
-    if config.auto_sv_correction || configured_sv_subgroup.is_some() {
+    // Record a dominant alternate repeat pairing, but defer topology selection until
+    // rebuild has measured complete flank-repeat-flank support for all four paths.
+    if round == 1 && force {
+        remove_path_if_exists(&repeat_pairing_marker_path(case))?;
+    }
+    let mut repeat_marker = read_repeat_pairing_marker(case)?;
+    let repeat_rebuild_applied = match repeat_marker.as_ref() {
+        Some(marker) if marker.state == "rebuild_ready" => {
+            rebuild_has_repeat_resolution(case, &marker.repeat_node)?
+        }
+        _ => false,
+    };
+
+    if config.auto_sv_correction
+        && configured_sv_subgroup.is_none()
+        && (repeat_marker.is_none() || repeat_rebuild_applied)
+    {
+        let unitig_graph = discover_unitig_graph(config, case);
+        if let Some(mismatch) = detect_repeat_pairing_mismatch(
+            &sv_subgroup_stats_path(case, round),
+            &sv_read_index_path(case, round),
+            &sv_read_evidence_path(case, round),
+            unitig_graph.as_deref(),
+        )? {
+            let repair_dir = checkpoint_dir.join("repeat_pairing_repair");
+            fs::create_dir_all(&repair_dir)?;
+            let mismatch_report = repair_dir.join("repeat_pairing_mismatch.tsv");
+            write_repeat_pairing_mismatch_report(&mismatch_report, &mismatch)?;
+
+            if repeat_rebuild_applied
+                && repeat_marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.repeat_node == mismatch.repeat_node)
+            {
+                let status_path = checkpoint_dir.join("checkpoint_2.status.tsv");
+                write_checkpoint2_status(
+                    &status_path,
+                    "manual_required",
+                    "repeat pairing mismatch remains after rebuild-constrained FASTA validation",
+                    round,
+                    &summary_path,
+                    &high_path,
+                    None,
+                    None,
+                )?;
+                append_repeat_pairing_metrics(
+                    &status_path,
+                    &mismatch,
+                    &mismatch_report,
+                    "repeat_pairing_rebuild_validation_failed",
+                )?;
+                if let Some(marker) = repeat_marker.as_mut() {
+                    marker.state = "failed".to_string();
+                    marker.validation_round = Some(round);
+                    write_repeat_pairing_marker(case, marker)?;
+                }
+                write_next_round_script(
+                    &checkpoint_dir.join("next_round.sh"),
+                    config,
+                    case,
+                    round + 1,
+                    None,
+                    Some("repeat pairing remains inconsistent after rebuild constraint"),
+                )?;
+                return Ok(Checkpoint2Status::ManualRequired);
+            }
+
+            let marker = RepeatPairingMarker {
+                state: "pending".to_string(),
+                repeat_node: mismatch.repeat_node.clone(),
+                source_round: round,
+                mismatch_report: mismatch_report.clone(),
+                rebuild_fasta: None,
+                validation_round: None,
+            };
+            write_repeat_pairing_marker(case, &marker)?;
+            repeat_marker = Some(marker);
+        }
+    }
+
+    if configured_sv_subgroup.is_some()
+        || (config.auto_sv_correction && sv_status.as_deref() != Some("pass"))
+    {
         let sv_high_path = sv_high_subgroups_path(case, round);
         let selected_sv_spec = if sv_high_path.exists() {
             select_sv_subgroup_spec(&sv_high_path, configured_sv_subgroup)?
@@ -1184,7 +1316,80 @@ fn checkpoint2_impl(
     }
 
     let edits = read_high_variant_edits(&high_path)?;
+    let repeat_can_advance = edits.is_empty() || !config.auto_snv_indel_correction;
+    if repeat_can_advance
+        && repeat_marker
+            .as_ref()
+            .is_some_and(|marker| marker.state == "pending")
+    {
+        let marker = repeat_marker.as_mut().unwrap();
+        let status_path = checkpoint_dir.join("checkpoint_2.status.tsv");
+        if !config.rebuild.enabled || round >= WORKFLOW_HARD_MAX_ROUNDS {
+            write_checkpoint2_status(
+                &status_path,
+                "manual_required",
+                "repeat pairing correction requires enabled rebuild and one remaining validation round",
+                round,
+                &summary_path,
+                &high_path,
+                None,
+                None,
+            )?;
+            append_repeat_marker_metrics(&status_path, marker, "repeat_pairing_rebuild_blocked")?;
+            return Ok(Checkpoint2Status::ManualRequired);
+        }
+
+        marker.state = "rebuild_ready".to_string();
+        marker.rebuild_fasta = Some(rebuild_fasta_path(case));
+        marker.validation_round = Some(round + 1);
+        write_repeat_pairing_marker(case, marker)?;
+        write_checkpoint2_status(
+            &status_path,
+            "rebuild_ready",
+            "repeat pairing mismatch is deferred to rebuild; constrain the triggered repeat with complete spanning-read support, then run one validate-only round",
+            round,
+            &summary_path,
+            &high_path,
+            None,
+            Some(&rebuild_fasta_path(case)),
+        )?;
+        append_repeat_marker_metrics(&status_path, marker, "repeat_pairing_rebuild")?;
+        append_checkpoint2_metrics(
+            &status_path,
+            &[
+                ("correction_kind", "sv".to_string()),
+                (
+                    "sv_correction_count",
+                    (sv_correction_count(case, round)? + 1).to_string(),
+                ),
+                ("ordinary_max_rounds", config.max_rounds.to_string()),
+                ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+            ],
+        )?;
+        write_repeat_rebuild_round_script(
+            &checkpoint_dir.join("next_round.sh"),
+            config,
+            case,
+            round,
+            &polished_aln,
+            marker,
+        )?;
+        if run_next {
+            run_repeat_rebuild_then_validate(config, case, round, &polished_aln, marker, force)?;
+        }
+        return Ok(Checkpoint2Status::RebuildReady);
+    }
+
     if edits.is_empty() {
+        if repeat_rebuild_applied {
+            if let Some(marker) = repeat_marker.as_mut() {
+                marker.state = "validated".to_string();
+                marker.validation_round = Some(round);
+                write_repeat_pairing_marker(case, marker)?;
+            }
+        }
+        let sv_corrections = sv_correction_count(case, round)?;
+        let ordinary_round = round.saturating_sub(sv_corrections);
         write_checkpoint2_status(
             &checkpoint_dir.join("checkpoint_2.status.tsv"),
             "complete",
@@ -1195,10 +1400,26 @@ fn checkpoint2_impl(
             None,
             None,
         )?;
+        append_checkpoint2_metrics(
+            &checkpoint_dir.join("checkpoint_2.status.tsv"),
+            &[
+                ("sv_correction_count", sv_corrections.to_string()),
+                ("ordinary_round", ordinary_round.to_string()),
+                ("ordinary_max_rounds", config.max_rounds.to_string()),
+                ("hard_max_rounds", WORKFLOW_HARD_MAX_ROUNDS.to_string()),
+            ],
+        )?;
         return Ok(Checkpoint2Status::Complete);
     }
 
     if !config.auto_snv_indel_correction {
+        if repeat_rebuild_applied {
+            if let Some(marker) = repeat_marker.as_mut() {
+                marker.state = "validated".to_string();
+                marker.validation_round = Some(round);
+                write_repeat_pairing_marker(case, marker)?;
+            }
+        }
         write_checkpoint2_status(
             &checkpoint_dir.join("checkpoint_2.status.tsv"),
             "complete",
@@ -1460,6 +1681,9 @@ fn write_plan_script(
     writeln!(script, "{}", resolve_command(config, case, config.force)).unwrap();
     writeln!(script).unwrap();
     writeln!(script, "final_polished=\"\"").unwrap();
+    writeln!(script, "next_round_draft=\"\"").unwrap();
+    writeln!(script, "repeat_resolution_node=\"\"").unwrap();
+    writeln!(script, "provisional_rebuild_fasta=\"\"").unwrap();
     writeln!(script).unwrap();
     write_stage_header(
         &mut script,
@@ -1472,10 +1696,20 @@ fn write_plan_script(
         let draft = round_draft_path(case, round);
         writeln!(script, "if [[ -z \"$final_polished\" ]]; then").unwrap();
         writeln!(script, "  # 04.polish round {round}").unwrap();
+        if round == 1 {
+            writeln!(script, "  round_draft={}", shell_quote(&draft)).unwrap();
+        } else {
+            writeln!(script, "  if [[ -n \"$next_round_draft\" ]]; then").unwrap();
+            writeln!(script, "    round_draft=\"$next_round_draft\"").unwrap();
+            writeln!(script, "    next_round_draft=\"\"").unwrap();
+            writeln!(script, "  else").unwrap();
+            writeln!(script, "    round_draft={}", shell_quote(&draft)).unwrap();
+            writeln!(script, "  fi").unwrap();
+        }
         writeln!(
             script,
             "  {}",
-            polish_command(config, case, round, &draft, config.force)
+            polish_command_with_draft_arg(config, case, round, "\"${round_draft}\"", config.force,)
         )
         .unwrap();
         writeln!(script, "  # checkpoint2 round {round}").unwrap();
@@ -1502,10 +1736,15 @@ fn write_plan_script(
         .unwrap();
         writeln!(script, "  case \"$checkpoint2_status\" in").unwrap();
         writeln!(script, "    complete)").unwrap();
+        let validated_fasta = if round == 1 {
+            polish_round_dir(case, round).join("02.polish/polished_aln.fasta")
+        } else {
+            polish_round_input_path(case, round)
+        };
         writeln!(
             script,
             "      final_polished={}",
-            shell_quote(&polished_aln_path(case, round))
+            shell_quote(&validated_fasta)
         )
         .unwrap();
         writeln!(
@@ -1531,6 +1770,77 @@ fn write_plan_script(
             )
             .unwrap();
             writeln!(script, "      exit 0").unwrap();
+            writeln!(script, "      ;;").unwrap();
+        }
+        writeln!(script, "    rebuild_ready)").unwrap();
+        if config.rebuild.enabled && round < WORKFLOW_HARD_MAX_ROUNDS {
+            writeln!(
+                script,
+                "      repeat_resolution_node=\"$(status_value {} repeat_node)\"",
+                shell_quote(&checkpoint2_status_path)
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "      if [[ -z \"$repeat_resolution_node\" ]]; then"
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "        echo \"checkpoint2 rebuild_ready did not provide repeat_node\" >&2"
+            )
+            .unwrap();
+            writeln!(script, "        exit 1").unwrap();
+            writeln!(script, "      fi").unwrap();
+            writeln!(
+                script,
+                "      {}",
+                rebuild_command_with_polished_arg(
+                    config,
+                    case,
+                    true,
+                    &shell_quote(&validated_fasta),
+                    Some("\"${repeat_resolution_node}\""),
+                )
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "      provisional_rebuild_fasta={}",
+                shell_quote(&rebuild_fasta_path(case))
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "      if [[ ! -s \"$provisional_rebuild_fasta\" ]]; then"
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "        echo \"repeat-constrained rebuild FASTA was not created\" >&2"
+            )
+            .unwrap();
+            writeln!(script, "        exit 1").unwrap();
+            writeln!(script, "      fi").unwrap();
+            writeln!(
+                script,
+                "      next_round_draft=\"$provisional_rebuild_fasta\""
+            )
+            .unwrap();
+            writeln!(
+                script,
+                "      echo \"checkpoint2 round {round} rebuilt repeat $repeat_resolution_node; validating in round {}\"",
+                round + 1
+            )
+            .unwrap();
+            writeln!(script, "      ;;").unwrap();
+        } else {
+            writeln!(
+                script,
+                "      echo \"checkpoint2 round {round} requested repeat rebuild, but rebuild is disabled or no validation round remains\" >&2"
+            )
+            .unwrap();
+            writeln!(script, "      exit 1").unwrap();
             writeln!(script, "      ;;").unwrap();
         }
         writeln!(script, "    manual_required)").unwrap();
@@ -1576,12 +1886,45 @@ fn write_plan_script(
         "rebuild the final verified graph and compact reports",
     );
     if config.rebuild.enabled {
+        writeln!(script, "if [[ -n \"$repeat_resolution_node\" ]]; then").unwrap();
         writeln!(
             script,
-            "{}",
-            rebuild_command_with_polished_arg(config, case, config.force, "\"${final_polished}\"",)
+            "  if [[ -s \"$provisional_rebuild_fasta\" ]] && cmp -s \"$final_polished\" \"$provisional_rebuild_fasta\"; then"
         )
         .unwrap();
+        writeln!(
+            script,
+            "    echo \"repeat-constrained rebuild already matches the final validated FASTA; skip duplicate rebuild\""
+        )
+        .unwrap();
+        writeln!(script, "  else").unwrap();
+        writeln!(
+            script,
+            "    {}",
+            rebuild_command_with_polished_arg(
+                config,
+                case,
+                true,
+                "\"${final_polished}\"",
+                Some("\"${repeat_resolution_node}\""),
+            )
+        )
+        .unwrap();
+        writeln!(script, "  fi").unwrap();
+        writeln!(script, "else").unwrap();
+        writeln!(
+            script,
+            "  {}",
+            rebuild_command_with_polished_arg(
+                config,
+                case,
+                config.force,
+                "\"${final_polished}\"",
+                None,
+            )
+        )
+        .unwrap();
+        writeln!(script, "fi").unwrap();
     } else {
         writeln!(
             script,
@@ -1798,6 +2141,91 @@ fn write_next_round_script(
     write_executable_text(path, &script)
 }
 
+fn write_repeat_rebuild_round_script(
+    path: &Path,
+    config: &WorkflowConfig,
+    case: &WorkflowCase,
+    source_round: usize,
+    polished_fasta: &Path,
+    marker: &RepeatPairingMarker,
+) -> Result<(), OrgraftError> {
+    let mut script = String::new();
+    writeln!(script, "#!/usr/bin/env bash").unwrap();
+    writeln!(script, "set -euo pipefail").unwrap();
+    writeln!(script).unwrap();
+    write_script_runtime_header(&mut script);
+    writeln!(
+        script,
+        "{}",
+        rebuild_command_with_polished_and_repeat(
+            config,
+            case,
+            config.force,
+            &polished_fasta.display().to_string(),
+            Some(&marker.repeat_node),
+        )
+    )
+    .unwrap();
+    writeln!(
+        script,
+        "{}",
+        polish_command(
+            config,
+            case,
+            source_round + 1,
+            &rebuild_fasta_path(case),
+            config.force,
+        )
+    )
+    .unwrap();
+    writeln!(
+        script,
+        "{} workflow checkpoint2 --config {} --case {} --round {}{}",
+        orgraft_shell_token(),
+        shell_quote(&config.config_path),
+        shell_quote_str(&case.name),
+        source_round + 1,
+        if config.force { " --force" } else { "" }
+    )
+    .unwrap();
+    write_executable_text(path, &script)
+}
+
+fn run_repeat_rebuild_then_validate(
+    config: &WorkflowConfig,
+    case: &WorkflowCase,
+    source_round: usize,
+    polished_fasta: &Path,
+    marker: &RepeatPairingMarker,
+    force: bool,
+) -> Result<(), OrgraftError> {
+    let rebuild_fasta = rebuild_fasta_path(case);
+    let already_built = !force
+        && rebuild_fasta.is_file()
+        && rebuild_has_repeat_resolution(case, &marker.repeat_node)?;
+    if !already_built {
+        commands::rebuild::run(&rebuild_args_with_polished(
+            config,
+            case,
+            force || case.rebuild_out_dir.exists(),
+            Some(polished_fasta),
+            Some(&marker.repeat_node),
+        )?)?;
+    }
+    if !rebuild_has_repeat_resolution(case, &marker.repeat_node)? {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "rebuild did not record constrained resolution for repeat `{}`",
+            marker.repeat_node
+        )));
+    }
+    let mut applied = marker.clone();
+    applied.state = "rebuild_ready".to_string();
+    applied.rebuild_fasta = Some(rebuild_fasta.clone());
+    applied.validation_round = Some(source_round + 1);
+    write_repeat_pairing_marker(case, &applied)?;
+    run_polish_round(config, case, source_round + 1, &rebuild_fasta, force)
+}
+
 fn write_script_runtime_header(script: &mut String) {
     writeln!(script, "if [[ -z \"${{ORGRAFT_BIN:-}}\" ]]; then").unwrap();
     writeln!(script, "  ORGRAFT_BIN={}", default_orgraft_bin()).unwrap();
@@ -1971,6 +2399,7 @@ fn rebuild_args_with_polished(
     case: &WorkflowCase,
     force: bool,
     polished_override: Option<&Path>,
+    repeat_resolution_node: Option<&str>,
 ) -> Result<Vec<String>, OrgraftError> {
     let rebuild = &config.rebuild;
     let polished = polished_override
@@ -2000,6 +2429,8 @@ fn rebuild_args_with_polished(
         edited_gfa.display().to_string(),
         "--polished-fasta".to_string(),
         polished.display().to_string(),
+        "--reads".to_string(),
+        case.reads.display().to_string(),
         "--soft-paths".to_string(),
         config.soft_paths.display().to_string(),
         "--out-dir".to_string(),
@@ -2018,6 +2449,11 @@ fn rebuild_args_with_polished(
     );
     push_raw_path_option(&mut args, "--minimap2", rebuild.minimap2.as_deref());
     push_raw_path_option(&mut args, "--blastn", rebuild.blastn.as_deref());
+    push_raw_string_option(
+        &mut args,
+        "--repeat-resolution-node",
+        repeat_resolution_node,
+    );
     push_raw_flag(&mut args, "--keep-debug", rebuild.keep_debug);
     push_raw_flag(&mut args, "--force", force);
     args.extend(rebuild.extra_args.iter().cloned());
@@ -2157,7 +2593,23 @@ fn rebuild_command_with_polished(
     force: bool,
     polished_fasta: &str,
 ) -> String {
-    rebuild_command_with_polished_arg(config, case, force, &shell_quote_str(polished_fasta))
+    rebuild_command_with_polished_arg(config, case, force, &shell_quote_str(polished_fasta), None)
+}
+
+fn rebuild_command_with_polished_and_repeat(
+    config: &WorkflowConfig,
+    case: &WorkflowCase,
+    force: bool,
+    polished_fasta: &str,
+    repeat_resolution_node: Option<&str>,
+) -> String {
+    rebuild_command_with_polished_arg(
+        config,
+        case,
+        force,
+        &shell_quote_str(polished_fasta),
+        repeat_resolution_node.map(shell_quote_str).as_deref(),
+    )
 }
 
 fn rebuild_command_with_polished_arg(
@@ -2165,6 +2617,7 @@ fn rebuild_command_with_polished_arg(
     case: &WorkflowCase,
     force: bool,
     polished_fasta_arg: &str,
+    repeat_resolution_node_arg: Option<&str>,
 ) -> String {
     let rebuild = &config.rebuild;
     let edited_gfa = case
@@ -2193,6 +2646,8 @@ fn rebuild_command_with_polished_arg(
         shell_quote(edited_gfa),
         "--polished-fasta".to_string(),
         polished_fasta_arg.to_string(),
+        "--reads".to_string(),
+        shell_quote(&case.reads),
         "--soft-paths".to_string(),
         shell_quote(&config.soft_paths),
         "--out-dir".to_string(),
@@ -2211,6 +2666,10 @@ fn rebuild_command_with_polished_arg(
     );
     push_path_option(&mut args, "--minimap2", rebuild.minimap2.as_deref());
     push_path_option(&mut args, "--blastn", rebuild.blastn.as_deref());
+    if let Some(value) = repeat_resolution_node_arg {
+        args.push("--repeat-resolution-node".to_string());
+        args.push(value.to_string());
+    }
     push_flag(&mut args, "--keep-debug", rebuild.keep_debug);
     push_flag(&mut args, "--force", force);
     args.extend(rebuild.extra_args.iter().cloned());
@@ -3881,6 +4340,223 @@ fn append_checkpoint2_metrics(path: &Path, metrics: &[(&str, String)]) -> Result
     Ok(())
 }
 
+fn repeat_pairing_marker_path(case: &WorkflowCase) -> PathBuf {
+    case.workflow_dir
+        .join("checkpoint_2")
+        .join("repeat_pairing.status.tsv")
+}
+
+fn write_repeat_pairing_marker(
+    case: &WorkflowCase,
+    marker: &RepeatPairingMarker,
+) -> Result<(), OrgraftError> {
+    let mut output = String::from("metric\tvalue\n");
+    push_metric(&mut output, "state", &marker.state);
+    push_metric(&mut output, "repeat_node", &marker.repeat_node);
+    push_metric(
+        &mut output,
+        "source_round",
+        &marker.source_round.to_string(),
+    );
+    push_metric(
+        &mut output,
+        "mismatch_report",
+        &marker.mismatch_report.display().to_string(),
+    );
+    push_metric(
+        &mut output,
+        "rebuild_fasta",
+        &marker
+            .rebuild_fasta
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+    );
+    push_metric(
+        &mut output,
+        "validation_round",
+        &marker
+            .validation_round
+            .map(|round| round.to_string())
+            .unwrap_or_else(|| ".".to_string()),
+    );
+    write_with_parent(&repeat_pairing_marker_path(case), &output)
+}
+
+fn read_repeat_pairing_marker(
+    case: &WorkflowCase,
+) -> Result<Option<RepeatPairingMarker>, OrgraftError> {
+    let path = repeat_pairing_marker_path(case);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let required = |metric: &str| -> Result<String, OrgraftError> {
+        read_metric_value(&path, metric)?.ok_or_else(|| {
+            OrgraftError::InvalidArgument(format!("{} is missing `{metric}`", path.display()))
+        })
+    };
+    let optional_path = |metric: &str| -> Result<Option<PathBuf>, OrgraftError> {
+        Ok(match required(metric)?.as_str() {
+            "." | "" => None,
+            value => Some(PathBuf::from(value)),
+        })
+    };
+    let optional_round = |metric: &str| -> Result<Option<usize>, OrgraftError> {
+        Ok(match required(metric)?.as_str() {
+            "." | "" => None,
+            value => Some(value.parse::<usize>().map_err(|_| {
+                OrgraftError::InvalidArgument(format!(
+                    "{} has invalid `{metric}` value `{value}`",
+                    path.display()
+                ))
+            })?),
+        })
+    };
+    Ok(Some(RepeatPairingMarker {
+        state: required("state")?,
+        repeat_node: required("repeat_node")?,
+        source_round: required("source_round")?.parse::<usize>().map_err(|_| {
+            OrgraftError::InvalidArgument(format!("{} has invalid source_round", path.display()))
+        })?,
+        mismatch_report: PathBuf::from(required("mismatch_report")?),
+        rebuild_fasta: optional_path("rebuild_fasta")?,
+        validation_round: optional_round("validation_round")?,
+    }))
+}
+
+fn append_repeat_pairing_metrics(
+    status_path: &Path,
+    mismatch: &RepeatPairingMismatch,
+    mismatch_report: &Path,
+    mode: &str,
+) -> Result<(), OrgraftError> {
+    append_checkpoint2_metrics(
+        status_path,
+        &[
+            ("sv_correction_mode", mode.to_string()),
+            ("repeat_node", mismatch.repeat_node.clone()),
+            ("repeat_length", mismatch.repeat_length.to_string()),
+            ("sv_subgroups", mismatch.subgroup_specs.join(",")),
+            (
+                "alternate_path_reads",
+                mismatch
+                    .alternate_path_reads
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            (
+                "reference_spanning_reads",
+                mismatch
+                    .reference_spanning_reads
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            (
+                "repeat_pairing_dominance_ratio",
+                format!("{:.6}", mismatch.dominance_ratio),
+            ),
+            (
+                "repeat_pairing_mismatch_report",
+                mismatch_report.display().to_string(),
+            ),
+        ],
+    )
+}
+
+fn append_repeat_marker_metrics(
+    status_path: &Path,
+    marker: &RepeatPairingMarker,
+    mode: &str,
+) -> Result<(), OrgraftError> {
+    append_checkpoint2_metrics(
+        status_path,
+        &[
+            ("sv_correction_mode", mode.to_string()),
+            ("repeat_node", marker.repeat_node.clone()),
+            (
+                "repeat_pairing_marker",
+                repeat_pairing_marker_path_for_display(status_path, marker),
+            ),
+            (
+                "repeat_pairing_mismatch_report",
+                marker.mismatch_report.display().to_string(),
+            ),
+            (
+                "repeat_pairing_source_round",
+                marker.source_round.to_string(),
+            ),
+            (
+                "repeat_pairing_validation_round",
+                marker
+                    .validation_round
+                    .map(|round| round.to_string())
+                    .unwrap_or_else(|| ".".to_string()),
+            ),
+        ],
+    )
+}
+
+fn repeat_pairing_marker_path_for_display(
+    status_path: &Path,
+    marker: &RepeatPairingMarker,
+) -> String {
+    status_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|path| path.join("repeat_pairing.status.tsv"))
+        .unwrap_or_else(|| marker.mismatch_report.clone())
+        .display()
+        .to_string()
+}
+
+fn rebuild_fasta_path(case: &WorkflowCase) -> PathBuf {
+    case.rebuild_out_dir
+        .join(&case.subgraph)
+        .join(format!("rebuild_{}.fasta", case.subgraph))
+}
+
+fn rebuild_result_stats_path(case: &WorkflowCase) -> PathBuf {
+    case.rebuild_out_dir
+        .join("logs")
+        .join(format!("rebuild_{}_result_stats.tsv", case.subgraph))
+}
+
+fn rebuild_has_repeat_resolution(
+    case: &WorkflowCase,
+    repeat_node: &str,
+) -> Result<bool, OrgraftError> {
+    let path = rebuild_result_stats_path(case);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    for line_result in BufReader::new(File::open(path)?).lines() {
+        let line = line_result?;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() >= 5 && fields[0] == "summary" && fields[3] == "repeat_resolution_node" {
+            return Ok(fields[4] == repeat_node);
+        }
+    }
+    Ok(false)
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool, OrgraftError> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    Ok(fs::read(left)? == fs::read(right)?)
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), OrgraftError> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn sv_correction_count(case: &WorkflowCase, before_round: usize) -> Result<usize, OrgraftError> {
     let mut count = 0usize;
     for round in 1..before_round {
@@ -4411,6 +5087,10 @@ fn sv_high_subgroups_path(case: &WorkflowCase, round: usize) -> PathBuf {
     polish_round_dir(case, round).join("03.validate/03.reports/sv_high_subgroups.tsv")
 }
 
+fn sv_subgroup_stats_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round).join("03.validate/03.reports/sv_subgroup_stats.tsv")
+}
+
 fn snv_indel_segments_path(case: &WorkflowCase, round: usize) -> PathBuf {
     polish_round_dir(case, round).join("03.validate/01.data/snv_indel_segments.tsv")
 }
@@ -4419,14 +5099,22 @@ fn sv_read_index_path(case: &WorkflowCase, round: usize) -> PathBuf {
     polish_round_dir(case, round).join("03.validate/01.data/sv_read_index.tsv")
 }
 
+fn sv_read_evidence_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round).join("03.validate/01.data/sv_read_evidence.tsv")
+}
+
 fn polished_aln_path(case: &WorkflowCase, round: usize) -> PathBuf {
     if round == 1 {
         polish_round_dir(case, round).join("02.polish/polished_aln.fasta")
     } else {
-        polish_round_dir(case, round)
-            .join("01.inputs")
-            .join(format!("linear_subgraph.round_{round}.fasta"))
+        polish_round_input_path(case, round)
     }
+}
+
+fn polish_round_input_path(case: &WorkflowCase, round: usize) -> PathBuf {
+    polish_round_dir(case, round)
+        .join("01.inputs")
+        .join(format!("linear_subgraph.round_{round}.fasta"))
 }
 
 fn polish_report_path(case: &WorkflowCase, round: usize) -> PathBuf {
@@ -4477,6 +5165,16 @@ fn polish_command(
     draft: &Path,
     force: bool,
 ) -> String {
+    polish_command_with_draft_arg(config, case, round, &shell_quote(draft), force)
+}
+
+fn polish_command_with_draft_arg(
+    config: &WorkflowConfig,
+    case: &WorkflowCase,
+    round: usize,
+    draft_arg: &str,
+    force: bool,
+) -> String {
     let mut args = vec![
         orgraft_shell_token().to_string(),
         "polish".to_string(),
@@ -4485,7 +5183,7 @@ fn polish_command(
         "--subgraph".to_string(),
         shell_quote_str(&case.subgraph),
         "--draft".to_string(),
-        shell_quote(draft),
+        draft_arg.to_string(),
         "--reference".to_string(),
         shell_quote(&polish_reference_path(case)),
         "--reads".to_string(),
@@ -4816,6 +5514,9 @@ results_dir = "{}/results_workflow"
 [workflow]
 max_rounds = 2
 
+[commands.rebuild]
+enabled = true
+
 [workflow.case]
 name = "mito_subgraph_001"
 organelle = "mito"
@@ -4880,8 +5581,12 @@ reference = "mito.fa"
         assert!(script.contains("checkpoint1_status="));
         assert!(script.contains("case \"$checkpoint2_status\" in"));
         assert!(script.contains("next_round_ready)"));
+        assert!(script.contains("rebuild_ready)"));
         assert!(script.contains("manual_required)"));
         assert!(script.contains("final_polished="));
+        assert!(script.contains("next_round_draft="));
+        assert!(script.contains("--repeat-resolution-node \"${repeat_resolution_node}\""));
+        assert!(!script.contains("next_round_repolish"));
         assert!(script.contains("\"${ORGRAFT_BIN}\" polish"));
         assert!(!script.contains("/04.polish/round_1/"));
         assert!(!script.contains("/04.polish/round_2/"));
@@ -5394,6 +6099,38 @@ name = "mito_subgraph_001"
         let status = checkpoint2_impl(&config, case, 1, true, false, None).unwrap();
         assert_eq!(status, Checkpoint2Status::Complete);
         assert!(!corrected_fasta_path(case, 1).exists());
+    }
+
+    #[test]
+    fn repeat_rebuild_validation_counts_as_an_sv_round() {
+        let dir = test_dir("workflow_repeat_rebuild_budget");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("workflow.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[project]\nresults_dir = \"{}\"\n\n[workflow]\nmax_rounds = 3\n\n[workflow.case]\nname = \"mito_subgraph_001\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let config = WorkflowConfig::from_path(&config_path).unwrap();
+        let case = &config.cases[0];
+        let round1_status = case
+            .workflow_dir
+            .join("checkpoint_2/round_1/checkpoint_2.status.tsv");
+        write_with_parent(
+            &round1_status,
+            "metric\tvalue\nstatus\trebuild_ready\ncorrection_kind\tsv\nsv_correction_mode\trepeat_pairing_rebuild\nrepeat_node\tutg5\n",
+        )
+        .unwrap();
+
+        assert_eq!(sv_correction_count(case, 2).unwrap(), 1);
+        assert_eq!(
+            2usize.saturating_sub(sv_correction_count(case, 2).unwrap()),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn test_dir(name: &str) -> PathBuf {

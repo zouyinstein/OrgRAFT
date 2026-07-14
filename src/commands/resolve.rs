@@ -1648,6 +1648,39 @@ struct AutoRepeatCandidate {
     merged_order_count: usize,
 }
 
+pub(crate) struct RepeatPathConstraintRequest<'a> {
+    pub component_gfa: &'a Path,
+    pub reference_fasta: &'a Path,
+    pub repeat_node: &'a str,
+    pub pairing_signature: &'a str,
+    pub max_states: usize,
+    pub max_candidates: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepeatPathConstraintCandidate {
+    pub candidate: String,
+    pub pairing_signature: String,
+    pub selected: bool,
+    pub score: Option<f64>,
+    pub continuous_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepeatPathConstraintResult {
+    pub sequence: String,
+    pub selected_candidate: String,
+    pub candidate_count: usize,
+    pub filtered_candidate_count: usize,
+    pub selection_method: String,
+    pub score: Option<f64>,
+    pub continuous_fraction: Option<f64>,
+    pub ordered_nodes: Vec<String>,
+    pub oriented_nodes: Vec<String>,
+    pub boundary_offsets: Vec<usize>,
+    pub candidates: Vec<RepeatPathConstraintCandidate>,
+}
+
 #[derive(Debug, Clone)]
 struct RepeatStep {
     node_id: String,
@@ -1660,6 +1693,7 @@ struct MergedSequence {
     sequence: String,
     ordered_nodes: Vec<String>,
     oriented_nodes: Vec<String>,
+    boundary_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1996,6 +2030,190 @@ fn build_auto_repeat_resolution_candidates(
         None
     };
     Ok((candidates, warning))
+}
+
+pub(crate) fn select_repeat_path_constrained_candidate(
+    request: &RepeatPathConstraintRequest<'_>,
+) -> Result<RepeatPathConstraintResult, OrgraftError> {
+    let graph = GfaGraph::read(request.component_gfa)?;
+    let (candidates, warning) = build_auto_repeat_resolution_candidates(
+        &graph,
+        request.max_states.max(1),
+        request.max_candidates.max(1),
+    )?;
+    if candidates.is_empty() {
+        return Err(OrgraftError::InvalidArgument(warning.unwrap_or_else(
+            || "repeat constraint generated no graph-valid candidates".to_string(),
+        )));
+    }
+
+    let mut candidate_pairings = Vec::with_capacity(candidates.len());
+    let mut matching = Vec::new();
+    for candidate in &candidates {
+        if !candidate.circular {
+            continue;
+        }
+        let signature = repeat_pairing_signature(&candidate.graph, request.repeat_node)?;
+        let selected = signature == request.pairing_signature;
+        candidate_pairings.push((candidate.id.clone(), signature, selected));
+        if selected {
+            matching.push(candidate.clone());
+        }
+    }
+    if matching.is_empty() {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "repeat `{}` pairing constraint `{}` matched no graph-valid circular candidates",
+            request.repeat_node, request.pairing_signature,
+        )));
+    }
+
+    let (selected, selection_method, selected_score) = if matching.len() == 1 {
+        (
+            &matching[0],
+            "unique_after_pairing_filter".to_string(),
+            None,
+        )
+    } else {
+        let references = build_reference_indexes(&read_fasta(request.reference_fasta)?);
+        let scores = score_candidates_against_references(&matching, &references)?;
+        let best = best_candidate_score(&scores).ok_or_else(|| {
+            OrgraftError::InvalidArgument(
+                "global k-mer chain produced no score for repeat-constrained candidates"
+                    .to_string(),
+            )
+        })?;
+        let tied = scores
+            .iter()
+            .filter(|score| candidate_scores_tied(score, &best))
+            .collect::<Vec<_>>();
+        if tied.len() != 1 {
+            return Err(OrgraftError::InvalidArgument(format!(
+                "repeat `{}` pairing constraint left {} candidates tied after global k-mer chain scoring",
+                request.repeat_node,
+                tied.len()
+            )));
+        }
+        let selected = matching
+            .iter()
+            .find(|candidate| candidate.id == best.candidate_id)
+            .ok_or_else(|| {
+                OrgraftError::InvalidArgument(
+                    "global k-mer chain selected a candidate outside the pairing filter"
+                        .to_string(),
+                )
+            })?;
+        (selected, best.method.clone(), Some(best))
+    };
+    let score_by_candidate = if matching.len() > 1 {
+        let references = build_reference_indexes(&read_fasta(request.reference_fasta)?);
+        score_candidates_against_references(&matching, &references)?
+            .into_iter()
+            .map(|score| (score.candidate_id.clone(), score))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let rows = candidate_pairings
+        .into_iter()
+        .map(|(candidate, pairing_signature, passed_filter)| {
+            let score = score_by_candidate.get(&candidate);
+            RepeatPathConstraintCandidate {
+                selected: candidate == selected.id,
+                candidate,
+                pairing_signature,
+                score: passed_filter
+                    .then(|| score.map(|value| value.score))
+                    .flatten(),
+                continuous_fraction: passed_filter
+                    .then(|| score.map(|value| value.continuous_fraction))
+                    .flatten(),
+            }
+        })
+        .collect();
+    let merged = merge_graph_to_sequence(&selected.graph)?;
+    Ok(RepeatPathConstraintResult {
+        sequence: merged.sequence,
+        selected_candidate: selected.id.clone(),
+        candidate_count: candidates.len(),
+        filtered_candidate_count: matching.len(),
+        selection_method,
+        score: selected_score.as_ref().map(|score| score.score),
+        continuous_fraction: selected_score
+            .as_ref()
+            .map(|score| score.continuous_fraction),
+        ordered_nodes: merged.ordered_nodes,
+        oriented_nodes: merged.oriented_nodes,
+        boundary_offsets: merged.boundary_offsets,
+        candidates: rows,
+    })
+}
+
+fn candidate_scores_tied(left: &CandidateScore, right: &CandidateScore) -> bool {
+    left.score == right.score
+        && left.continuous_fraction == right.continuous_fraction
+        && left.diagonal_fraction == right.diagonal_fraction
+        && left.length_delta == right.length_delta
+}
+
+fn repeat_pairing_signature(graph: &GfaGraph, repeat_node: &str) -> Result<String, OrgraftError> {
+    let copy_prefix = format!("{repeat_node}_copy");
+    let mut copies = graph
+        .segments
+        .keys()
+        .filter(|name| name.as_str() == repeat_node || name.starts_with(&copy_prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    copies.sort_by(|left, right| natural_cmp(left, right));
+    if copies.len() != 2 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "resolved candidate has {} copies of repeat `{repeat_node}`; expected 2",
+            copies.len()
+        )));
+    }
+
+    let links = unique_valid_links(graph);
+    let mut physical_paths = Vec::new();
+    for copy in copies {
+        let mut neighbors_by_side: BTreeMap<char, Vec<String>> = BTreeMap::new();
+        for link in &links {
+            let Some(repeat_side) = link_endpoint_side(link, &copy) else {
+                continue;
+            };
+            let other = if link.from_name == copy {
+                &link.to_name
+            } else {
+                &link.from_name
+            };
+            if other == &copy {
+                continue;
+            }
+            let other_side = link_endpoint_side(link, other).ok_or_else(|| {
+                OrgraftError::InvalidArgument(format!(
+                    "could not determine endpoint for `{other}` adjacent to repeat `{copy}`"
+                ))
+            })?;
+            neighbors_by_side
+                .entry(repeat_side)
+                .or_default()
+                .push(format!("{other}{other_side}"));
+        }
+        for neighbors in neighbors_by_side.values_mut() {
+            neighbors.sort();
+            neighbors.dedup();
+        }
+        let minus = neighbors_by_side.get(&'-').cloned().unwrap_or_default();
+        let plus = neighbors_by_side.get(&'+').cloned().unwrap_or_default();
+        if minus.len() != 1 || plus.len() != 1 {
+            return Err(OrgraftError::InvalidArgument(format!(
+                "resolved repeat copy `{copy}` does not have one neighbor on each endpoint"
+            )));
+        }
+        let mut pair = [minus[0].clone(), plus[0].clone()];
+        pair.sort();
+        physical_paths.push(format!("{}--{}", pair[0], pair[1]));
+    }
+    physical_paths.sort();
+    Ok(physical_paths.join("|"))
 }
 
 fn duplicate_node(graph: &mut GfaGraph, node_id: &str) -> Result<String, OrgraftError> {
@@ -2816,6 +3034,7 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
             sequence: segment.sequence.clone(),
             ordered_nodes: vec![segment.name.clone()],
             oriented_nodes: vec![format!("{}+", segment.name)],
+            boundary_offsets: vec![0],
         });
     }
 
@@ -2824,6 +3043,7 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
     let orientations = orient_path(&order, &links_by_pair);
     let mut sequence = String::new();
     let mut oriented_nodes = Vec::new();
+    let mut boundary_offsets = Vec::new();
     for (index, (node_id, orient)) in order.iter().zip(orientations.iter()).enumerate() {
         let segment = graph.segments.get(node_id).ok_or_else(|| {
             OrgraftError::InvalidArgument(format!(
@@ -2840,6 +3060,7 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
             let trim = overlap.min(part.len());
             part = part[trim..].to_string();
         }
+        boundary_offsets.push(sequence.len());
         sequence.push_str(&part);
         oriented_nodes.push(format!("{node_id}{orient}"));
     }
@@ -2847,6 +3068,7 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
         sequence,
         ordered_nodes: order,
         oriented_nodes,
+        boundary_offsets,
     })
 }
 
@@ -5517,6 +5739,49 @@ mod tests {
         assert_eq!(warning, None);
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().all(|candidate| candidate.circular));
+    }
+
+    #[test]
+    fn repeat_pairing_constraint_selects_b1s225_like_candidate_three() {
+        let graph_path = temp_file_path("repeat-pairing-constraint", "gfa");
+        let reference_path = temp_file_path("repeat-pairing-reference", "fasta");
+        fs::write(
+            &graph_path,
+            concat!(
+                "S\tutg1\tAAAA\n",
+                "S\tutg2\tCCCC\n",
+                "S\tlong\tGGGG\n",
+                "S\tutg7\tTTTT\n",
+                "S\tutg0\tACAC\n",
+                "S\tutg5\tGTGT\n",
+                "L\tutg0\t+\tlong\t+\t0M\n",
+                "L\tutg0\t+\tutg7\t+\t0M\n",
+                "L\tutg0\t-\tutg1\t+\t0M\n",
+                "L\tutg0\t-\tutg2\t+\t0M\n",
+                "L\tutg1\t+\tutg5\t-\t0M\n",
+                "L\tlong\t+\tutg5\t+\t0M\n",
+                "L\tutg2\t+\tutg5\t+\t0M\n",
+                "L\tutg5\t+\tutg7\t-\t0M\n",
+            ),
+        )
+        .unwrap();
+        fs::write(&reference_path, ">subgraph_001\nAAAAGTGTGGGGACACTTTTCCCC\n").unwrap();
+
+        let result = select_repeat_path_constrained_candidate(&RepeatPathConstraintRequest {
+            component_gfa: &graph_path,
+            reference_fasta: &reference_path,
+            repeat_node: "utg5",
+            pairing_signature: "long+--utg1+|utg2+--utg7+",
+            max_states: 5_000,
+            max_candidates: 100,
+        })
+        .unwrap();
+
+        assert_eq!(result.selected_candidate, "auto_repeat_003");
+        assert_eq!(result.filtered_candidate_count, 1);
+        assert_eq!(result.selection_method, "unique_after_pairing_filter");
+        let _ = fs::remove_file(graph_path);
+        let _ = fs::remove_file(reference_path);
     }
 
     #[test]

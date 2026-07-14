@@ -17,6 +17,10 @@ const DEFAULT_CANDIDATE_EVALUATIONS: usize = 24;
 const MIN_TARGET_TYPE1_FRACTION: f64 = 0.80;
 const MAX_GLOBAL_SUPPORT_DROP: f64 = 0.005;
 const IMPROVEMENT_EPSILON: f64 = 1e-6;
+const REPEAT_PAIRING_MIN_OVERLAP_BP: f64 = 500.0;
+const REPEAT_PAIRING_MIN_PATH_READS: usize = 10;
+const REPEAT_PAIRING_MIN_DOMINANCE_RATIO: f64 = 3.0;
+const REPEAT_PAIRING_FLANK_BP: usize = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SvMetrics {
@@ -54,6 +58,36 @@ pub(crate) struct SvRepairResult {
     pub target_type1_reads: usize,
     pub graph_localization: SvGraphLocalization,
     pub evaluation: SvCandidateEvaluation,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepeatPairingMismatch {
+    pub repeat_node: String,
+    pub repeat_length: usize,
+    pub representative_group: String,
+    pub representative_old_index: usize,
+    pub subgroup_specs: Vec<String>,
+    pub alternate_path_reads: [usize; 2],
+    pub reference_spanning_reads: [usize; 2],
+    pub repeat_intervals: [(usize, usize); 2],
+    pub dominance_ratio: f64,
+    pub target_read_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatPairingSubgroupRow {
+    old_index: usize,
+    start: usize,
+    end: usize,
+    reads: usize,
+    overlap: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PhysicalRepeatPath {
+    endpoints: (usize, usize),
+    overlap: f64,
+    rows: Vec<RepeatPairingSubgroupRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +195,186 @@ pub(crate) fn select_sv_subgroup_spec(
 ) -> Result<Option<String>, OrgraftError> {
     let rows = read_high_subgroups(high_subgroups)?;
     Ok(select_subgroup(&rows, manual_subgroup)?.map(|row| row.spec()))
+}
+
+pub(crate) fn detect_repeat_pairing_mismatch(
+    subgroup_stats: &Path,
+    read_index: &Path,
+    read_evidence: &Path,
+    unitig_graph: Option<&Path>,
+) -> Result<Option<RepeatPairingMismatch>, OrgraftError> {
+    if !subgroup_stats.is_file() || !read_index.is_file() || !read_evidence.is_file() {
+        return Ok(None);
+    }
+
+    let rows = read_repeat_pairing_subgroups(subgroup_stats)?;
+    let physical_paths = collapse_reciprocal_repeat_paths(&rows);
+    let read_rows = read_index_rows(read_index)?;
+    let evidence = read_primary_evidence(read_evidence)?;
+    let baseline_type1 = read_rows
+        .iter()
+        .filter(|row| row.read_class == "FL" && row.group_name == "type_1_subtype_NA")
+        .map(|row| row.read_id.clone())
+        .collect::<HashSet<_>>();
+    let max_reference_position = evidence.iter().map(|row| row.target_end).max().unwrap_or(0);
+    let mut mismatches = Vec::new();
+
+    for left_index in 0..physical_paths.len() {
+        for right_index in left_index + 1..physical_paths.len() {
+            let left = &physical_paths[left_index];
+            let right = &physical_paths[right_index];
+            let repeat_length = ((left.overlap + right.overlap) / 2.0).round() as usize;
+            let tolerance = ((repeat_length as f64 * 0.15).round() as usize).max(50);
+            let first_delta = left.endpoints.0.abs_diff(right.endpoints.0);
+            let second_delta = left.endpoints.1.abs_diff(right.endpoints.1);
+            if first_delta.abs_diff(repeat_length) > tolerance
+                || second_delta.abs_diff(repeat_length) > tolerance
+            {
+                continue;
+            }
+
+            let intervals = [
+                ordered_pair(left.endpoints.0, right.endpoints.0),
+                ordered_pair(left.endpoints.1, right.endpoints.1),
+            ];
+            if intervals.iter().any(|(start, end)| {
+                *start <= REPEAT_PAIRING_FLANK_BP
+                    || end.saturating_add(REPEAT_PAIRING_FLANK_BP) > max_reference_position
+            }) {
+                continue;
+            }
+
+            let left_specs = path_specs(left);
+            let right_specs = path_specs(right);
+            let left_ids = ids_for_subgroup_specs(&read_rows, &left_specs);
+            let right_ids = ids_for_subgroup_specs(&read_rows, &right_specs);
+            let alternate_path_reads = [left_ids.len(), right_ids.len()];
+            if alternate_path_reads
+                .iter()
+                .any(|count| *count < REPEAT_PAIRING_MIN_PATH_READS)
+            {
+                continue;
+            }
+
+            let reference_spanning_reads = intervals
+                .map(|interval| spanning_type1_reads(&evidence, &baseline_type1, interval).len());
+            let alternate_total = alternate_path_reads.iter().sum::<usize>();
+            let reference_total = reference_spanning_reads.iter().sum::<usize>();
+            let dominance_ratio = alternate_total as f64 / reference_total.max(1) as f64;
+            if dominance_ratio < REPEAT_PAIRING_MIN_DOMINANCE_RATIO {
+                continue;
+            }
+
+            let mut all_rows = left.rows.iter().chain(&right.rows).collect::<Vec<_>>();
+            all_rows.sort_by(|a, b| {
+                b.reads
+                    .cmp(&a.reads)
+                    .then_with(|| a.old_index.cmp(&b.old_index))
+            });
+            let representative = all_rows[0];
+            let mut subgroup_specs = left_specs;
+            subgroup_specs.extend(right_specs);
+            subgroup_specs.sort();
+            subgroup_specs.dedup();
+            let mut target_read_ids = left_ids;
+            target_read_ids.extend(right_ids);
+            let Some(unitig_graph) = unitig_graph.filter(|path| path.is_file()) else {
+                continue;
+            };
+            let Some(repeat_node) = unique_repeat_node_for_length(unitig_graph, repeat_length)?
+            else {
+                continue;
+            };
+
+            mismatches.push(RepeatPairingMismatch {
+                repeat_node,
+                repeat_length,
+                representative_group: "type_2_subtype_rep_NA".to_string(),
+                representative_old_index: representative.old_index,
+                subgroup_specs,
+                alternate_path_reads,
+                reference_spanning_reads,
+                repeat_intervals: intervals,
+                dominance_ratio,
+                target_read_ids,
+            });
+        }
+    }
+
+    mismatches.sort_by(|left, right| {
+        right
+            .dominance_ratio
+            .partial_cmp(&left.dominance_ratio)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.target_read_ids.len().cmp(&left.target_read_ids.len()))
+            .then_with(|| left.repeat_node.cmp(&right.repeat_node))
+    });
+    Ok(mismatches.into_iter().next())
+}
+
+pub(crate) fn write_repeat_pairing_mismatch_report(
+    path: &Path,
+    mismatch: &RepeatPairingMismatch,
+) -> Result<(), OrgraftError> {
+    let mut output = String::from("metric\tvalue\n");
+    metric(&mut output, "status", "repeat_pairing_mismatch");
+    metric(&mut output, "repeat_node", &mismatch.repeat_node);
+    metric(
+        &mut output,
+        "repeat_length",
+        &mismatch.repeat_length.to_string(),
+    );
+    metric(
+        &mut output,
+        "repeat_intervals",
+        &mismatch
+            .repeat_intervals
+            .iter()
+            .map(|(start, end)| format!("{start}-{end}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    metric(
+        &mut output,
+        "alternate_path_reads",
+        &mismatch
+            .alternate_path_reads
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    metric(
+        &mut output,
+        "reference_spanning_reads",
+        &mismatch
+            .reference_spanning_reads
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    metric(
+        &mut output,
+        "dominance_ratio",
+        &format!("{:.6}", mismatch.dominance_ratio),
+    );
+    metric(&mut output, "subgroups", &mismatch.subgroup_specs.join(","));
+    metric(
+        &mut output,
+        "representative_subgroup",
+        &format!(
+            "{}:{}",
+            mismatch.representative_group, mismatch.representative_old_index
+        ),
+    );
+    metric(
+        &mut output,
+        "target_reads",
+        &mismatch.target_read_ids.len().to_string(),
+    );
+    fs::write(path, output)?;
+    Ok(())
 }
 
 pub(crate) fn repair_sv_subgroup(
@@ -446,6 +660,273 @@ fn normalize_group_name(value: &str) -> String {
         .replace("_subtype_", "_")
         .trim_end_matches("_NA")
         .to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RepeatReadIndexRow {
+    read_id: String,
+    read_class: String,
+    group_name: String,
+    old_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PrimaryEvidenceRow {
+    read_id: String,
+    target_start: usize,
+    target_end: usize,
+}
+
+fn read_repeat_pairing_subgroups(
+    path: &Path,
+) -> Result<Vec<RepeatPairingSubgroupRow>, OrgraftError> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| OrgraftError::InvalidArgument(format!("{} is empty", path.display())))?;
+    let columns = header_columns(&header);
+    let mut rows = Vec::new();
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if field(&fields, &columns, "group_name", path)? != "type_2_subtype_rep_NA" {
+            continue;
+        }
+        let reads = parse_usize_field(&fields, &columns, "subgroup_reads", path)?;
+        let overlap = parse_f64_field(&fields, &columns, "mid_olps", path)?;
+        if reads < REPEAT_PAIRING_MIN_PATH_READS || overlap < REPEAT_PAIRING_MIN_OVERLAP_BP {
+            continue;
+        }
+        let boundary_key = field(&fields, &columns, "boundary_key", path)?.to_string();
+        let (start, end) = parse_first_boundary_pair(&boundary_key, path)?;
+        rows.push(RepeatPairingSubgroupRow {
+            old_index: parse_usize_field(&fields, &columns, "old_index", path)?,
+            start,
+            end,
+            reads,
+            overlap,
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_first_boundary_pair(value: &str, path: &Path) -> Result<(usize, usize), OrgraftError> {
+    let first = value.split(';').next().unwrap_or(value);
+    let mut se = None;
+    let mut ss = None;
+    for item in first.split(',') {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        let parsed = value.parse::<usize>().map_err(|error| {
+            OrgraftError::InvalidArgument(format!(
+                "{} has invalid boundary `{item}`: {error}",
+                path.display()
+            ))
+        })?;
+        if key.starts_with("se") {
+            se = Some(parsed);
+        } else if key.starts_with("ss") {
+            ss = Some(parsed);
+        }
+    }
+    match (se, ss) {
+        (Some(se), Some(ss)) => Ok((se, ss)),
+        _ => Err(OrgraftError::InvalidArgument(format!(
+            "{} has invalid repeat boundary key `{value}`",
+            path.display()
+        ))),
+    }
+}
+
+fn collapse_reciprocal_repeat_paths(rows: &[RepeatPairingSubgroupRow]) -> Vec<PhysicalRepeatPath> {
+    let mut grouped: BTreeMap<(usize, usize), Vec<RepeatPairingSubgroupRow>> = BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry(ordered_pair(row.start, row.end))
+            .or_default()
+            .push(row.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(endpoints, rows)| PhysicalRepeatPath {
+            endpoints,
+            overlap: rows.iter().map(|row| row.overlap).sum::<f64>() / rows.len() as f64,
+            rows,
+        })
+        .collect()
+}
+
+fn path_specs(path: &PhysicalRepeatPath) -> Vec<String> {
+    path.rows
+        .iter()
+        .map(|row| format!("type_2_subtype_rep_NA:{}", row.old_index))
+        .collect()
+}
+
+fn read_index_rows(path: &Path) -> Result<Vec<RepeatReadIndexRow>, OrgraftError> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| OrgraftError::InvalidArgument(format!("{} is empty", path.display())))?;
+    let columns = header_columns(&header);
+    let mut rows = Vec::new();
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let old_index = field(&fields, &columns, "subgroup_old_index", path)?;
+        rows.push(RepeatReadIndexRow {
+            read_id: field(&fields, &columns, "read_id", path)?.to_string(),
+            read_class: field(&fields, &columns, "read_class", path)?.to_string(),
+            group_name: field(&fields, &columns, "group_name", path)?.to_string(),
+            old_index: if old_index == "." {
+                None
+            } else {
+                Some(old_index.parse::<usize>().map_err(|error| {
+                    OrgraftError::InvalidArgument(format!(
+                        "{} has invalid subgroup_old_index `{old_index}`: {error}",
+                        path.display()
+                    ))
+                })?)
+            },
+        });
+    }
+    Ok(rows)
+}
+
+fn ids_for_subgroup_specs(rows: &[RepeatReadIndexRow], specs: &[String]) -> HashSet<String> {
+    let specs = specs
+        .iter()
+        .filter_map(|spec| spec.rsplit_once(':'))
+        .filter_map(|(group, index)| Some((group, index.parse::<usize>().ok()?)))
+        .collect::<HashSet<_>>();
+    rows.iter()
+        .filter(|row| {
+            row.read_class == "FL"
+                && row
+                    .old_index
+                    .is_some_and(|index| specs.contains(&(row.group_name.as_str(), index)))
+        })
+        .map(|row| row.read_id.clone())
+        .collect()
+}
+
+fn read_primary_evidence(path: &Path) -> Result<Vec<PrimaryEvidenceRow>, OrgraftError> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| OrgraftError::InvalidArgument(format!("{} is empty", path.display())))?;
+    let columns = header_columns(&header);
+    let mut rows = Vec::new();
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if field(&fields, &columns, "alignment_role", path)? == "secondary"
+            || field(&fields, &columns, "target_start", path)? == "."
+        {
+            continue;
+        }
+        rows.push(PrimaryEvidenceRow {
+            read_id: field(&fields, &columns, "read_id", path)?.to_string(),
+            target_start: parse_usize_field(&fields, &columns, "target_start", path)?,
+            target_end: parse_usize_field(&fields, &columns, "target_end", path)?,
+        });
+    }
+    Ok(rows)
+}
+
+fn spanning_type1_reads(
+    evidence: &[PrimaryEvidenceRow],
+    type1_ids: &HashSet<String>,
+    interval: (usize, usize),
+) -> HashSet<String> {
+    let required_start = interval.0.saturating_sub(REPEAT_PAIRING_FLANK_BP);
+    let required_end = interval.1.saturating_add(REPEAT_PAIRING_FLANK_BP);
+    evidence
+        .iter()
+        .filter(|row| {
+            type1_ids.contains(&row.read_id)
+                && row.target_start <= required_start
+                && row.target_end >= required_end
+        })
+        .map(|row| row.read_id.clone())
+        .collect()
+}
+
+fn unique_repeat_node_for_length(
+    path: &Path,
+    repeat_length: usize,
+) -> Result<Option<String>, OrgraftError> {
+    let file = File::open(path)?;
+    let mut lengths = BTreeMap::new();
+    let mut degree = HashMap::<String, usize>::new();
+    let mut links = HashSet::new();
+    for line_result in BufReader::new(file).lines() {
+        let line = line_result?;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("S") if fields.len() >= 3 => {
+                let length = if fields[2] != "*" {
+                    fields[2].len()
+                } else {
+                    fields[3..]
+                        .iter()
+                        .find_map(|field| field.strip_prefix("LN:i:"))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0)
+                };
+                lengths.insert(fields[1].to_string(), length);
+            }
+            Some("L") if fields.len() >= 5 => {
+                let left = format!("{}{}", fields[1], fields[2]);
+                let right = format!("{}{}", fields[3], fields[4]);
+                let key = if left <= right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                if links.insert(key) {
+                    *degree.entry(fields[1].to_string()).or_default() += 1;
+                    *degree.entry(fields[3].to_string()).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let tolerance = ((repeat_length as f64 * 0.15).round() as usize).max(50);
+    let mut candidates = lengths
+        .into_iter()
+        .filter(|(name, length)| {
+            degree.get(name).copied().unwrap_or(0) >= 4
+                && length.abs_diff(repeat_length) <= tolerance
+        })
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    Ok((candidates.len() == 1).then(|| candidates.remove(0)))
+}
+
+fn ordered_pair(left: usize, right: usize) -> (usize, usize) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
 }
 
 fn read_segments(path: &Path) -> Result<Vec<Segment>, OrgraftError> {
@@ -1210,6 +1691,10 @@ fn circular_equivalent(left: &str, right: &str) -> bool {
 }
 
 fn count_type1_reads(path: &Path, target_ids: &HashSet<String>) -> Result<usize, OrgraftError> {
+    Ok(type1_read_ids(path)?.intersection(target_ids).count())
+}
+
+fn type1_read_ids(path: &Path) -> Result<HashSet<String>, OrgraftError> {
     let file = File::open(path)?;
     let mut lines = BufReader::new(file).lines();
     let header = lines
@@ -1217,17 +1702,17 @@ fn count_type1_reads(path: &Path, target_ids: &HashSet<String>) -> Result<usize,
         .transpose()?
         .ok_or_else(|| OrgraftError::InvalidArgument(format!("{} is empty", path.display())))?;
     let columns = header_columns(&header);
-    let mut count = 0usize;
+    let mut ids = HashSet::new();
     for line_result in lines {
         let line = line_result?;
         let fields = line.split('\t').collect::<Vec<_>>();
         let read_id = field(&fields, &columns, "read_id", path)?;
         let group = field(&fields, &columns, "group_name", path)?;
-        if target_ids.contains(read_id) && group == "type_1_subtype_NA" {
-            count += 1;
+        if group == "type_1_subtype_NA" {
+            ids.insert(read_id.to_string());
         }
     }
-    Ok(count)
+    Ok(ids)
 }
 
 fn candidate_improves(score: &CandidateScore, baseline: SvMetrics) -> bool {
@@ -1608,6 +2093,7 @@ fn flip_orient(orient: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shortened_group_name_matches_full_subtype_name() {
@@ -1704,5 +2190,84 @@ mod tests {
         assert!(select_subgroup(&rows, Some("type_3_rep_rep:5"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn repeat_pairing_detector_selects_the_dominant_minor_pairing_repeat() {
+        let dir = test_dir("repeat_pairing_detector");
+        fs::create_dir_all(&dir).unwrap();
+        let subgroup_stats = dir.join("sv_subgroup_stats.tsv");
+        let read_index = dir.join("sv_read_index.tsv");
+        let read_evidence = dir.join("sv_read_evidence.tsv");
+        let graph = dir.join("graph.gfa");
+
+        fs::write(
+            &subgroup_stats,
+            concat!(
+                "group_name\told_index\tboundary_key\tsubgroup_reads\tmid_olps\n",
+                "type_2_subtype_rep_NA\t1\tse1=10000,ss2=50000\t12\t1000\n",
+                "type_2_subtype_rep_NA\t2\tse1=50000,ss2=10000\t12\t1000\n",
+                "type_2_subtype_rep_NA\t3\tse1=11000,ss2=51000\t12\t1000\n",
+                "type_2_subtype_rep_NA\t4\tse1=51000,ss2=11000\t12\t1000\n",
+            ),
+        )
+        .unwrap();
+        let mut index = String::from("read_id\tread_class\tgroup_name\tsubgroup_old_index\n");
+        for old_index in 1..=4 {
+            for read in 1..=12 {
+                writeln!(
+                    index,
+                    "alt_{old_index}_{read}\tFL\ttype_2_subtype_rep_NA\t{old_index}"
+                )
+                .unwrap();
+            }
+        }
+        for read in 1..=4 {
+            writeln!(index, "ref_{read}\tFL\ttype_1_subtype_NA\t.").unwrap();
+        }
+        fs::write(&read_index, index).unwrap();
+        fs::write(
+            &read_evidence,
+            concat!(
+                "read_id\talignment_role\ttarget_start\ttarget_end\n",
+                "ref_1\tprimary\t8000\t13000\n",
+                "ref_2\tprimary\t8000\t13000\n",
+                "ref_3\tprimary\t48000\t53000\n",
+                "ref_4\tprimary\t48000\t53000\n",
+            ),
+        )
+        .unwrap();
+        let repeat = "A".repeat(1_000);
+        let flank = "C".repeat(2_000);
+        fs::write(
+            &graph,
+            format!(
+                "S\tutg5\t{repeat}\nS\tleft_a\t{flank}\nS\tleft_b\t{flank}\nS\tright_a\t{flank}\nS\tright_b\t{flank}\nL\tleft_a\t+\tutg5\t+\t0M\nL\tleft_b\t+\tutg5\t+\t0M\nL\tutg5\t+\tright_a\t+\t0M\nL\tutg5\t+\tright_b\t+\t0M\n"
+            ),
+        )
+        .unwrap();
+
+        let mismatch = detect_repeat_pairing_mismatch(
+            &subgroup_stats,
+            &read_index,
+            &read_evidence,
+            Some(&graph),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mismatch.repeat_node, "utg5");
+        assert_eq!(mismatch.repeat_length, 1_000);
+        assert_eq!(mismatch.alternate_path_reads, [24, 24]);
+        assert_eq!(mismatch.reference_spanning_reads, [2, 2]);
+        assert!(mismatch.dominance_ratio >= 3.0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("orgraft_{name}_{nanos}"))
     }
 }

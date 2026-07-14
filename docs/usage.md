@@ -203,6 +203,17 @@ when `low_green_window_fraction` improves without reducing global reference
 support. Set case-level `sv_correction_subgroup = "group_name:old_index"` or
 pass `--sv-subgroup` to choose the subgroup manually.
 
+Repeat-pairing mismatch is a separate checkpoint 2 path. When two alternative
+flank pairings dominate the complete reads spanning the pairing currently used
+by the linear FASTA, workflow records the matching repeat node and returns
+`rebuild_ready`. Rebuild measures complete flank-repeat-flank support for all
+four paths and uses the dominant perfect pairing to filter complete graph-valid
+single-circle candidates. A unique survivor is selected directly; if more than
+one survives, the existing global k-mer-chain score against the current polished
+FASTA breaks the tie. No candidate or a tied top score requires manual review.
+The unresolved rebuild GFA keeps all four `P` records and real read counts, while
+the constrained rebuild FASTA is validated with all reads in the next round.
+
 Before changing sequence, SV check projects subgroup breakpoints back to
 `02.anchor_graph_core/02.unitig_graph/graph.gfa` and writes
 `sv_repair/sv_graph_localization.tsv`. It distinguishes breakpoints inside one
@@ -211,10 +222,12 @@ connections between unitig ends. The graph path is derived automatically;
 set case-level `unitig_graph = "/path/to/02.unitig_graph/graph.gfa"` only for a
 nonstandard layout. Projection is advisory and never modifies the GFA.
 
-An accepted SV repair adds one full-read validation round without consuming
-the ordinary `max_rounds` budget. For example, one SV repair changes the
-default maximum actual round from 3 to 4. Multiple SV repairs may extend it,
-but the hard total is 10. Once no repairable SV subgroup remains, checkpoint 2
+An accepted subgroup-level SV repair or repeat-pairing rebuild adds one full-read
+validation round without consuming the ordinary `max_rounds` budget. The
+repeat-pairing round is validate-only: its `02.polish` directory remains empty
+and `01.inputs/linear_subgraph.round_N.fasta` is the constrained rebuild FASTA.
+The hard total across the workflow remains 10. Once no repairable SV subgroup
+remains, checkpoint 2
 applies SNV/InDel correction under the ordinary budget. If both validations
 pass, the case is complete.
 
@@ -258,6 +271,8 @@ results_workflow/
       checkpoint_2/
         round_1/
           checkpoint_2.status.tsv
+          repeat_pairing_repair/
+            repeat_pairing_mismatch.tsv
           pos_ref_alt.txt
           polish_aln_v2.fasta
 ```

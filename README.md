@@ -73,7 +73,11 @@ correction rounds. SV check also projects abnormal breakpoints onto the
 read-only `02.unitig_graph/graph.gfa` so manual review can distinguish an
 internal unitig split from a link-level problem. Accepted SV repairs add a
 validation round without consuming the ordinary round budget; total validation
-rounds are capped at 10.
+rounds are capped at 10. A dominant repeat-pairing mismatch is recorded at
+checkpoint 2 without changing resolve output. Rebuild then counts reads that
+completely span each flank-repeat-flank path, uses the dominant pairing to
+filter graph-valid circular candidates, and writes the constrained rebuild
+FASTA. The next round is validate-only, so `02.polish` remains empty.
 
 ## Runtime Dependencies
 

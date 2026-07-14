@@ -59,8 +59,21 @@ Workflow-generated roots are numbered for the major products:
 | `workflow checkpoint1` | `checkpoint_1.status.tsv`, `checked_draft.gfa`, optional `manual_edit_required.gfa` | Topology and GFA consistency gate before resolve |
 | `resolve` | `ORGANELLE/graph/merged_unresolved.gfa`, `merged_unresolved_subgraph_001.gfa`, `ORGANELLE/fasta/rotated_reference.fasta`, `resolved_subgraphs.fasta`, `logs/resolve_details.tsv` | Uses checked draft graph plus reference FASTA |
 | `polish` | `ORGANELLE/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}`; round 2+ leaves `02.polish` empty and validates `01.inputs/linear_subgraph.round_N.fasta` | Plot scripts require `matplotlib` |
-| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `sv_repair/{sv_repair.tsv,sv_candidate_scores.tsv,sv_graph_localization.tsv}`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | Localizes abnormal breakpoints on the read-only `02.unitig_graph`, repairs one subgroup at a time, and extends SV rounds up to a hard total of 10 |
-| `rebuild` | `OUT/SUBGRAPH/rebuild_SUBGRAPH.gfa`, `rebuild_SUBGRAPH.fasta`, `rebuild_SUBGRAPH_nodes.fasta`, `OUT/logs/*.tsv` | PDF/SVG export is attempted only when an image reference is supplied |
+| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `sv_repair/{sv_repair.tsv,sv_candidate_scores.tsv,sv_graph_localization.tsv}`, optional `repeat_pairing_repair/repeat_pairing_mismatch.tsv`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | Prepares one correction at a time; a repeat-pairing mismatch emits `rebuild_ready` and preserves resolve output |
+| `rebuild` | `OUT/SUBGRAPH/rebuild_SUBGRAPH.gfa`, `rebuild_SUBGRAPH.fasta`, `rebuild_SUBGRAPH_nodes.fasta`, `OUT/logs/*.tsv` | Workflow passes reads so repeat `P` records carry complete flank-repeat-flank read counts; optional repeat constraint filters graph-valid circular candidates before writing FASTA |
+
+## Repeat-Pairing Constraint
+
+Checkpoint 2 only records the repeat implicated by the validation mismatch.
+Rebuild retains the unresolved graph and writes all four real spanning-read path
+counts as `P` records. It then uses the uniquely dominant perfect pairing as a
+hard filter over complete graph-valid circular candidates. One remaining
+candidate is selected directly; multiple candidates retain the existing global
+k-mer-chain scoring against the current polished FASTA. No match or a top-score
+tie stops for manual review. The constrained FASTA is passed to one additional
+validate-only round, while the rebuild GFA remains unresolved and auditable.
+The first constrained rebuild's candidate ID is retained as `source_candidate`;
+`local_candidate` records any renumbering after later sequence correction.
 
 ## Rebuild Outputs
 
@@ -93,6 +106,8 @@ Important rebuild tables:
 | `rebuild_SUBGRAPH_extract.tsv` | one row per verified node copy projected onto polished coordinates | Node extraction and sequence projection evidence |
 | `rebuild_SUBGRAPH_run_report.tsv` | `section`, `key`, `value` | Run metadata, tool status, input/output paths, image-export status |
 | `rebuild_SUBGRAPH_result_stats.tsv` | `section`, `subgraph`, `item`, `metric`, `value`, `extra` | Summary, graph, consistency, depth, and repeat-path metrics |
+| `rebuild_SUBGRAPH_repeat_path_support.tsv` | repeat path, endpoints, support count, ratio, read IDs | Audit trail for `PM:Z:spanning_reads` and integer `RC:i` path tags |
+| `rebuild_SUBGRAPH_repeat_resolution.tsv` | dominant pairing, filtered candidates, source/local candidate IDs, orientation/rotation | Audit trail for optional constrained FASTA generation |
 
 ## Topology Assumption
 

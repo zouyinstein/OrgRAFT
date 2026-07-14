@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ Inputs:
   --subgraph ID                 subgraph/ring id [subgraph_001]
   --edited-gfa FILE             edited/check graph GFA
   --polished-fasta FILE         final polished FASTA
+  --reads FILE                  organelle reads for repeat-path support
   --soft-paths FILE             tool paths file [soft_paths.txt]
 
 Outputs:
@@ -32,6 +34,7 @@ Outputs:
 Additional Parameters:
   --threads N                   minimap2 threads for node-to-polished projection [4]
   --image-reference-fasta FILE  reference FASTA for graph colouring; enables PDF/SVG export
+  --repeat-resolution-node NODE constrain one repeat using complete spanning-read support
 
 Layout: OUT/SUBGRAPH/rebuild_SUBGRAPH* plus OUT/logs/*.tsv (pdf/svg need reference)
 "#;
@@ -41,6 +44,10 @@ const DEFAULT_THREADS: usize = 4;
 const DEFAULT_ORGANELLE: &str = "mito";
 const DEFAULT_SUBGRAPH: &str = "subgraph_001";
 const DEFAULT_OUT_DIR: &str = "results/rebuild";
+const REPEAT_PATH_TEMPLATE_FLANK_BP: usize = 2_000;
+const REPEAT_PATH_REQUIRED_FLANK_BP: usize = 1_000;
+const REPEAT_PATH_ALIGNMENT_TOLERANCE_BP: usize = 50;
+const REPEAT_PATH_MIN_IDENTITY: f64 = 0.95;
 
 pub fn run(args: &[String]) -> Result<(), OrgraftError> {
     if args.is_empty() {
@@ -63,6 +70,17 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
     let started = Instant::now();
     let edited_gfa = canonicalize_existing(&options.edited_gfa, "--edited-gfa")?;
     let polished_fasta = canonicalize_existing(&options.polished_fasta, "--polished-fasta")?;
+    let reads = options
+        .reads
+        .as_ref()
+        .map(|path| canonicalize_existing(path, "--reads"))
+        .transpose()?;
+    if options.repeat_resolution_node.is_some() && reads.is_none() {
+        return Err(OrgraftError::InvalidArgument(
+            "--repeat-resolution-node requires --reads for complete flank-repeat-flank support"
+                .to_string(),
+        ));
+    }
     let image_reference_fasta = options
         .image_reference_fasta
         .as_ref()
@@ -73,6 +91,14 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
         .as_ref()
         .map(|path| canonicalize_existing(path, "--merged-gfa-template"))
         .transpose()?;
+
+    // A final force rebuild re-enumerates candidates after sequence correction.
+    // Keep the candidate ID from the first constrained rebuild as provenance.
+    let previous_paths = OutputPaths::new(&options.out_dir, &options.subgraph);
+    let prior_repeat_resolution = options
+        .repeat_resolution_node
+        .as_deref()
+        .and_then(|repeat_node| read_prior_repeat_resolution(&previous_paths, repeat_node));
 
     if options.out_dir.exists() {
         if options.force {
@@ -152,20 +178,74 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
     let coverage_rows =
         compute_node_remapped_coverage(&mapping, &node_classes, validate_data_dir.as_deref())?;
     annotate_gfa_with_remapped_coverage(&mut verified_gfa, &coverage_rows);
+    // Spanning-read templates must come from assembly node sequences. Projecting
+    // them through the currently tested linear FASTA would bake that FASTA's
+    // repeat pairing into the evidence used to judge the pairing.
     let repeat_path_rows = repeat_path_support_rows(
-        &verified_gfa,
-        &mapping,
+        &merged_gfa,
         &node_classes,
-        polished_record,
-        validate_data_dir.as_deref(),
+        reads.as_deref(),
+        &minimap2,
+        options.threads,
+        &paths,
+        options.keep_debug,
     )?;
     attach_repeat_path_support_paths(&mut verified_gfa, &repeat_path_rows);
-    write_single_fasta(
-        &paths.verified_fasta,
-        &polished_record.header,
-        &polished_record.sequence,
-    )?;
+    write_repeat_path_support(&paths.repeat_path_support, &repeat_path_rows)?;
     verified_gfa.write(&paths.verified_gfa)?;
+
+    let repeat_resolution = if let Some(repeat_node) = options.repeat_resolution_node.as_deref() {
+        let decision = select_dominant_repeat_pairing(&repeat_path_rows, repeat_node)?;
+        let constrained = crate::commands::resolve::select_repeat_path_constrained_candidate(
+            &crate::commands::resolve::RepeatPathConstraintRequest {
+                component_gfa: &paths.verified_gfa,
+                reference_fasta: &polished_fasta,
+                repeat_node,
+                pairing_signature: &decision.pairing_signature,
+                max_states: 5_000,
+                max_candidates: 100,
+            },
+        )?;
+        let (sequence, orientation, rotation_offset, exact_position_matches) =
+            normalize_repeat_constrained_sequence(
+                &constrained.sequence,
+                &polished_record.sequence,
+                &constrained.boundary_offsets,
+            )?;
+        write_single_fasta(&paths.verified_fasta, &polished_record.header, &sequence)?;
+        let local_candidate = constrained.selected_candidate.clone();
+        let selected_candidate = source_repeat_candidate(
+            prior_repeat_resolution.as_ref(),
+            &decision,
+            &local_candidate,
+        );
+        let outcome = RepeatResolutionOutcome {
+            decision,
+            selected_candidate,
+            local_candidate,
+            candidate_count: constrained.candidate_count,
+            filtered_candidate_count: constrained.filtered_candidate_count,
+            selection_method: constrained.selection_method,
+            score: constrained.score,
+            continuous_fraction: constrained.continuous_fraction,
+            ordered_nodes: constrained.ordered_nodes,
+            oriented_nodes: constrained.oriented_nodes,
+            orientation,
+            rotation_offset,
+            exact_position_matches,
+            candidates: constrained.candidates,
+        };
+        write_repeat_resolution(&paths.repeat_resolution, Some(&outcome))?;
+        Some(outcome)
+    } else {
+        write_single_fasta(
+            &paths.verified_fasta,
+            &polished_record.header,
+            &polished_record.sequence,
+        )?;
+        write_repeat_resolution(&paths.repeat_resolution, None)?;
+        None
+    };
     write_node_fasta(&paths.verified_nodes_fasta, &verified_gfa)?;
     let (gfa_editor_cli, image_exports) =
         if let Some(image_reference_fasta) = image_reference_fasta.as_deref() {
@@ -223,7 +303,36 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
         ("edited_gfa", edited_gfa.display().to_string()),
         ("polished_fasta", polished_fasta.display().to_string()),
         ("merge_mode", merge_mode.clone()),
-        ("repeat_resolution", "disabled".to_string()),
+        (
+            "repeat_resolution",
+            if repeat_resolution.is_some() {
+                "spanning_read_constrained"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+        ),
+        (
+            "repeat_resolution_node",
+            repeat_resolution
+                .as_ref()
+                .map(|outcome| outcome.decision.repeat_node.clone())
+                .unwrap_or_else(|| ".".to_string()),
+        ),
+        (
+            "repeat_resolution_candidate",
+            repeat_resolution
+                .as_ref()
+                .map(|outcome| outcome.selected_candidate.clone())
+                .unwrap_or_else(|| ".".to_string()),
+        ),
+        (
+            "repeat_resolution_local_candidate",
+            repeat_resolution
+                .as_ref()
+                .map(|outcome| outcome.local_candidate.clone())
+                .unwrap_or_else(|| ".".to_string()),
+        ),
         (
             "sequence_projection_method",
             sequence_projection_method.clone(),
@@ -278,9 +387,11 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
         options,
         &edited_gfa,
         &polished_fasta,
+        reads.as_deref(),
         image_reference_fasta.as_deref(),
         validate_data_dir.as_deref(),
         &merge_mode,
+        repeat_resolution.as_ref(),
         &sequence_projection_method,
         &minimap2,
         &blastn,
@@ -316,6 +427,8 @@ fn contract() -> CommandContract {
             "--subgraph ID",
             "--edited-gfa FILE",
             "--polished-fasta FILE",
+            "optional --reads FILE for complete flank-repeat-flank path support",
+            "optional --repeat-resolution-node NODE for checkpoint-triggered path constraint",
             "optional --image-reference-fasta FILE",
             "optional --merged-gfa-template FILE",
             "soft_paths.txt containing minimap2, blastn, and optional gfa_editor_cli",
@@ -329,11 +442,13 @@ fn contract() -> CommandContract {
             "logs/rebuild_subgraph_001_extract.tsv",
             "logs/rebuild_subgraph_001_run_report.tsv",
             "logs/rebuild_subgraph_001_result_stats.tsv",
+            "logs/rebuild_subgraph_001_repeat_path_support.tsv",
+            "logs/rebuild_subgraph_001_repeat_resolution.tsv",
         ],
         notes: &[
             "rebuild logic is Rust; optional PDF/SVG export calls the GFA_Editor CLI",
             "auto merge follows the conservative non-repeat linear compaction used by resolve/verified_gfa",
-            "auto repeat resolution is intentionally disabled",
+            "repeat resolution is disabled unless one checkpoint-triggered node is constrained by complete spanning-read support",
             "minimap2 projects merged graph nodes; blastn self-BLAST finds maximal exact repeat cores",
         ],
     }
@@ -343,12 +458,14 @@ fn contract() -> CommandContract {
 struct RebuildOptions {
     edited_gfa: PathBuf,
     polished_fasta: PathBuf,
+    reads: Option<PathBuf>,
     out_dir: PathBuf,
     soft_paths: PathBuf,
     image_reference_fasta: Option<PathBuf>,
     merged_gfa_template: Option<PathBuf>,
     minimap2: Option<PathBuf>,
     blastn: Option<PathBuf>,
+    repeat_resolution_node: Option<String>,
     organelle: String,
     subgraph: String,
     threads: usize,
@@ -360,12 +477,14 @@ impl RebuildOptions {
     fn from_args(args: &[String]) -> Result<Self, OrgraftError> {
         let mut edited_gfa = None;
         let mut polished_fasta = None;
+        let mut reads = None;
         let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
         let mut soft_paths = PathBuf::from(DEFAULT_SOFT_PATHS);
         let mut image_reference_fasta = None;
         let mut merged_gfa_template = None;
         let mut minimap2 = None;
         let mut blastn = None;
+        let mut repeat_resolution_node = None;
         let mut organelle = DEFAULT_ORGANELLE.to_string();
         let mut subgraph = DEFAULT_SUBGRAPH.to_string();
         let mut threads = DEFAULT_THREADS;
@@ -381,6 +500,9 @@ impl RebuildOptions {
                 }
                 "--polished-fasta" | "--verified-fasta" | "--final-fasta" | "--fasta" => {
                     polished_fasta = Some(PathBuf::from(required_value(args, &mut index, arg)?));
+                }
+                "--reads" => {
+                    reads = Some(PathBuf::from(required_value(args, &mut index, arg)?));
                 }
                 "--out-dir" | "--output-dir" => {
                     out_dir = PathBuf::from(required_value(args, &mut index, arg)?);
@@ -401,6 +523,10 @@ impl RebuildOptions {
                 }
                 "--minimap2" => {
                     minimap2 = Some(PathBuf::from(required_value(args, &mut index, arg)?));
+                }
+                "--repeat-resolution-node" => {
+                    repeat_resolution_node =
+                        Some(required_value(args, &mut index, arg)?.to_string());
                 }
                 "--organelle" => {
                     organelle = required_value(args, &mut index, arg)?.to_string();
@@ -434,12 +560,14 @@ impl RebuildOptions {
             polished_fasta: polished_fasta.ok_or_else(|| {
                 OrgraftError::InvalidArgument("missing --polished-fasta FILE".to_string())
             })?,
+            reads,
             out_dir,
             soft_paths,
             image_reference_fasta,
             merged_gfa_template,
             minimap2,
             blastn,
+            repeat_resolution_node,
             organelle,
             subgraph,
             threads,
@@ -462,6 +590,8 @@ struct OutputPaths {
     extract_report: PathBuf,
     run_report: PathBuf,
     result_stats: PathBuf,
+    repeat_path_support: PathBuf,
+    repeat_resolution: PathBuf,
 }
 
 impl OutputPaths {
@@ -481,6 +611,8 @@ impl OutputPaths {
             extract_report: logs_dir.join(format!("{stem}_extract.tsv")),
             run_report: logs_dir.join(format!("{stem}_run_report.tsv")),
             result_stats: logs_dir.join(format!("{stem}_result_stats.tsv")),
+            repeat_path_support: logs_dir.join(format!("{stem}_repeat_path_support.tsv")),
+            repeat_resolution: logs_dir.join(format!("{stem}_repeat_resolution.tsv")),
         }
     }
 
@@ -1284,7 +1416,7 @@ fn make_verified_gfa_from_sequences(
         );
         if node_classes[name] == "repeat_node" {
             tags = replace_tag(&tags, "RT:Z:unresolved".to_string());
-            tags = replace_tag(&tags, "PM:Z:edge_rc_min_proxy".to_string());
+            tags = replace_tag(&tags, "PM:Z:repeat_path_support_pending".to_string());
         }
         segments.insert(
             name.clone(),
@@ -2494,9 +2626,11 @@ fn write_run_report(
     options: &RebuildOptions,
     edited_gfa: &Path,
     polished_fasta: &Path,
+    reads: Option<&Path>,
     image_reference_fasta: Option<&Path>,
     validate_data_dir: Option<&Path>,
     merge_mode: &str,
+    repeat_resolution: Option<&RepeatResolutionOutcome>,
     sequence_projection_method: &str,
     minimap2: &Path,
     blastn: &Path,
@@ -2522,6 +2656,13 @@ fn write_run_report(
             "input",
             "polished_fasta",
             polished_fasta.display().to_string(),
+        ),
+        (
+            "input",
+            "reads",
+            reads
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
         ),
         (
             "input",
@@ -2568,6 +2709,16 @@ fn write_run_report(
             relative_output_path(out_dir, &paths.result_stats),
         ),
         (
+            "output",
+            "repeat_path_support",
+            relative_output_path(out_dir, &paths.repeat_path_support),
+        ),
+        (
+            "output",
+            "repeat_resolution",
+            relative_output_path(out_dir, &paths.repeat_resolution),
+        ),
+        (
             "file_description",
             "rebuild_fasta",
             "complete verified/polished linear sequence for the subgraph".to_string(),
@@ -2578,7 +2729,20 @@ fn write_run_report(
             "FASTA records extracted from each S node in the rebuilt GFA".to_string(),
         ),
         ("method", "merge_mode", merge_mode.to_string()),
-        ("method", "repeat_resolution", "disabled".to_string()),
+        (
+            "method",
+            "repeat_resolution",
+            repeat_resolution
+                .map(|outcome| {
+                    format!(
+                        "spanning_read_constrained:{}:source={}:local={}",
+                        outcome.decision.repeat_node,
+                        outcome.selected_candidate,
+                        outcome.local_candidate,
+                    )
+                })
+                .unwrap_or_else(|| "disabled".to_string()),
+        ),
         (
             "method",
             "sequence_projection",
@@ -2722,7 +2886,7 @@ fn write_result_stats(
             out,
             "repeat_path\t{subgraph}\t{}\tpath_support\t{}\tstatus={};method={};left={};right={};ratio={};left_edge={};right_edge={};left_support={};right_support={}",
             row.repeat_node,
-            optional_f64(row.path_support),
+            optional_usize(row.path_support),
             row.repeat_status,
             row.support_method,
             row.left_endpoint,
@@ -2931,20 +3095,259 @@ struct RepeatPathSupportRow {
     right_edge_index: Option<usize>,
     left_endpoint: String,
     right_endpoint: String,
+    left_physical_endpoint: String,
+    right_physical_endpoint: String,
     left_support: Option<f64>,
     right_support: Option<f64>,
-    path_support: Option<f64>,
+    path_support: Option<usize>,
     path_ratio: Option<f64>,
+    supporting_read_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatPathEdge {
+    index: usize,
+    endpoint_name: String,
+    endpoint_orient: char,
+    endpoint_side: char,
+    support: f64,
+    overlap: usize,
+}
+
+impl RepeatPathEdge {
+    fn label(&self) -> String {
+        oriented_node(&self.endpoint_name, self.endpoint_orient)
+    }
+
+    fn physical_label(&self) -> String {
+        oriented_node(&self.endpoint_name, self.endpoint_side)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RepeatPathTemplate {
+    id: String,
+    repeat_node: String,
+    row_index: usize,
+    sequence: String,
+    required_start: usize,
+    required_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatPathAlignment {
+    read_id: String,
+    target_id: String,
+    query_start: usize,
+    query_end: usize,
+    target_start: usize,
+    target_end: usize,
+    matches: usize,
+    mapq: usize,
+    primary: bool,
+}
+
+impl RepeatPathAlignment {
+    fn identity(&self) -> f64 {
+        let aligned_span = self.query_span().min(self.target_span());
+        if aligned_span == 0 {
+            0.0
+        } else {
+            self.matches as f64 / aligned_span as f64
+        }
+    }
+
+    fn query_span(&self) -> usize {
+        self.query_end.saturating_sub(self.query_start)
+    }
+
+    fn target_span(&self) -> usize {
+        self.target_end.saturating_sub(self.target_start)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RepeatResolutionDecision {
+    repeat_node: String,
+    pairing_signature: String,
+    selected_paths: Vec<String>,
+    selected_support: usize,
+    alternative_support: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatResolutionOutcome {
+    decision: RepeatResolutionDecision,
+    // Stable ID from the first constrained rebuild on the original candidate set.
+    selected_candidate: String,
+    // ID after re-enumerating candidates against this rebuild's corrected sequence.
+    local_candidate: String,
+    candidate_count: usize,
+    filtered_candidate_count: usize,
+    selection_method: String,
+    score: Option<f64>,
+    continuous_fraction: Option<f64>,
+    ordered_nodes: Vec<String>,
+    oriented_nodes: Vec<String>,
+    orientation: char,
+    rotation_offset: usize,
+    exact_position_matches: usize,
+    candidates: Vec<crate::commands::resolve::RepeatPathConstraintCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorRepeatResolution {
+    repeat_node: String,
+    pairing_signature: String,
+    source_candidate: String,
+}
+
+fn read_prior_repeat_resolution(
+    paths: &OutputPaths,
+    requested_repeat_node: &str,
+) -> Option<PriorRepeatResolution> {
+    let stats = fs::read_to_string(&paths.result_stats).ok()?;
+    let mut repeat_node = None;
+    let mut source_candidate = None;
+    for line in stats.lines().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 5 || fields[0] != "summary" {
+            continue;
+        }
+        match fields[3] {
+            "repeat_resolution_node" => repeat_node = Some(fields[4].to_string()),
+            "repeat_resolution_candidate" => source_candidate = Some(fields[4].to_string()),
+            _ => {}
+        }
+    }
+    let repeat_node = repeat_node?;
+    let source_candidate = source_candidate?;
+    if repeat_node != requested_repeat_node || source_candidate == "." {
+        return None;
+    }
+
+    let resolution = fs::read_to_string(&paths.repeat_resolution).ok()?;
+    let pairing_signature = resolution.lines().skip(1).find_map(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        (fields.len() >= 3 && fields[0] == "summary" && fields[1] == repeat_node)
+            .then(|| fields[2].to_string())
+    })?;
+    if pairing_signature == "." {
+        return None;
+    }
+
+    Some(PriorRepeatResolution {
+        repeat_node,
+        pairing_signature,
+        source_candidate,
+    })
+}
+
+fn source_repeat_candidate(
+    prior: Option<&PriorRepeatResolution>,
+    decision: &RepeatResolutionDecision,
+    local_candidate: &str,
+) -> String {
+    prior
+        .filter(|prior| {
+            prior.repeat_node == decision.repeat_node
+                && prior.pairing_signature == decision.pairing_signature
+        })
+        .map(|prior| prior.source_candidate.clone())
+        .unwrap_or_else(|| local_candidate.to_string())
+}
+
+fn select_dominant_repeat_pairing(
+    rows: &[RepeatPathSupportRow],
+    repeat_node: &str,
+) -> Result<RepeatResolutionDecision, OrgraftError> {
+    let target = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.repeat_node == repeat_node)
+        .collect::<Vec<_>>();
+    if target.len() != 4 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "repeat `{repeat_node}` has {} complete path rows; expected 4 for a 2-in/2-out repeat",
+            target.len()
+        )));
+    }
+
+    let mut pairings = Vec::new();
+    for left in 0..target.len() {
+        for right in (left + 1)..target.len() {
+            let (_, left_row) = target[left];
+            let (_, right_row) = target[right];
+            if left_row.left_edge_index == right_row.left_edge_index
+                || left_row.right_edge_index == right_row.right_edge_index
+            {
+                continue;
+            }
+            let left_support = left_row.path_support.ok_or_else(|| {
+                OrgraftError::InvalidArgument(format!(
+                    "repeat `{repeat_node}` path support is unavailable; --reads is required"
+                ))
+            })?;
+            let right_support = right_row.path_support.ok_or_else(|| {
+                OrgraftError::InvalidArgument(format!(
+                    "repeat `{repeat_node}` path support is unavailable; --reads is required"
+                ))
+            })?;
+            let mut signatures = [
+                repeat_path_physical_signature(left_row),
+                repeat_path_physical_signature(right_row),
+            ];
+            signatures.sort();
+            pairings.push((
+                left_support + right_support,
+                vec![format!("p{}", left + 1), format!("p{}", right + 1)],
+                signatures.join("|"),
+            ));
+        }
+    }
+    pairings.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    if pairings.len() != 2 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "repeat `{repeat_node}` produced {} perfect flank pairings; expected 2",
+            pairings.len()
+        )));
+    }
+    if pairings[0].0 == pairings[1].0 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "repeat `{repeat_node}` has tied complete-read pairing support ({})",
+            pairings[0].0
+        )));
+    }
+
+    Ok(RepeatResolutionDecision {
+        repeat_node: repeat_node.to_string(),
+        pairing_signature: pairings[0].2.clone(),
+        selected_paths: pairings[0].1.clone(),
+        selected_support: pairings[0].0,
+        alternative_support: pairings[1].0,
+    })
+}
+
+fn repeat_path_physical_signature(row: &RepeatPathSupportRow) -> String {
+    let mut endpoints = [
+        row.left_physical_endpoint.clone(),
+        row.right_physical_endpoint.clone(),
+    ];
+    endpoints.sort();
+    format!("{}--{}", endpoints[0], endpoints[1])
 }
 
 fn repeat_path_support_rows(
     gfa: &Gfa,
-    _mapping: &Mapping,
     node_classes: &BTreeMap<String, String>,
-    _record: &FastaRecord,
-    _validate_data_dir: Option<&Path>,
+    reads: Option<&Path>,
+    minimap2: &Path,
+    threads: usize,
+    paths: &OutputPaths,
+    keep_debug: bool,
 ) -> Result<Vec<RepeatPathSupportRow>, OrgraftError> {
     let mut rows = Vec::new();
+    let mut templates = Vec::new();
     for (node, class) in node_classes {
         if class != "repeat_node" {
             continue;
@@ -2953,11 +3356,7 @@ fn repeat_path_support_rows(
         let mut right = Vec::new();
         for (index, link) in gfa.links.iter().enumerate() {
             if let Some(side) = link_endpoint_side(link, node) {
-                let item = (
-                    index + 1,
-                    other_link_endpoint(link, node),
-                    link_support(link),
-                );
+                let item = repeat_path_edge(link, node, index + 1)?;
                 if side == '-' {
                     left.push(item)
                 } else {
@@ -2972,54 +3371,461 @@ fn repeat_path_support_rows(
         } else {
             "ambiguous"
         };
-        let combos: Vec<_> = left
-            .iter()
-            .flat_map(|l| right.iter().map(move |r| (l, r, l.2.min(r.2))))
-            .collect();
-        let total: f64 = combos.iter().map(|(_, _, support)| *support).sum();
-        if combos.is_empty() {
+        if left.is_empty() || right.is_empty() {
             rows.push(RepeatPathSupportRow {
                 repeat_node: node.clone(),
                 repeat_status: status.to_string(),
-                support_method: "edge_rc_min_proxy".to_string(),
+                support_method: "unavailable_without_complete_path".to_string(),
                 left_edge_index: None,
                 right_edge_index: None,
                 left_endpoint: ".".to_string(),
                 right_endpoint: ".".to_string(),
+                left_physical_endpoint: ".".to_string(),
+                right_physical_endpoint: ".".to_string(),
                 left_support: None,
                 right_support: None,
                 path_support: None,
                 path_ratio: None,
+                supporting_read_ids: Vec::new(),
             });
         }
-        for (l, r, support) in combos {
-            let ratio = if total > 0.0 { support / total } else { 0.0 };
-            rows.push(RepeatPathSupportRow {
-                repeat_node: node.clone(),
-                repeat_status: status.to_string(),
-                support_method: "edge_rc_min_proxy".to_string(),
-                left_edge_index: Some(l.0),
-                right_edge_index: Some(r.0),
-                left_endpoint: l.1.clone(),
-                right_endpoint: r.1.clone(),
-                left_support: Some(l.2),
-                right_support: Some(r.2),
-                path_support: Some(support),
-                path_ratio: Some(ratio),
-            });
+        for left_edge in &left {
+            for right_edge in &right {
+                let row_index = rows.len();
+                let id = format!("repeat_path_{:04}", templates.len() + 1);
+                let (sequence, required_start, required_end) =
+                    spell_repeat_path_template(gfa, node, left_edge, right_edge)?;
+                templates.push(RepeatPathTemplate {
+                    id,
+                    repeat_node: node.clone(),
+                    row_index,
+                    sequence,
+                    required_start,
+                    required_end,
+                });
+                rows.push(RepeatPathSupportRow {
+                    repeat_node: node.clone(),
+                    repeat_status: status.to_string(),
+                    support_method: if reads.is_some() {
+                        "spanning_reads".to_string()
+                    } else {
+                        "unavailable_without_reads".to_string()
+                    },
+                    left_edge_index: Some(left_edge.index),
+                    right_edge_index: Some(right_edge.index),
+                    left_endpoint: left_edge.label(),
+                    right_endpoint: right_edge.label(),
+                    left_physical_endpoint: left_edge.physical_label(),
+                    right_physical_endpoint: right_edge.physical_label(),
+                    left_support: Some(left_edge.support),
+                    right_support: Some(right_edge.support),
+                    path_support: reads.map(|_| 0),
+                    path_ratio: reads.map(|_| 0.0),
+                    supporting_read_ids: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if let Some(reads) = reads {
+        let support =
+            map_reads_to_repeat_paths(&templates, reads, minimap2, threads, paths, keep_debug)?;
+        for template in &templates {
+            let mut read_ids = support.get(&template.id).cloned().unwrap_or_default();
+            read_ids.sort();
+            read_ids.dedup();
+            rows[template.row_index].path_support = Some(read_ids.len());
+            rows[template.row_index].supporting_read_ids = read_ids;
+        }
+        let mut totals = BTreeMap::<String, usize>::new();
+        for row in &rows {
+            if let Some(count) = row.path_support {
+                *totals.entry(row.repeat_node.clone()).or_default() += count;
+            }
+        }
+        for row in &mut rows {
+            if let Some(count) = row.path_support {
+                let total = totals.get(&row.repeat_node).copied().unwrap_or(0);
+                row.path_ratio = Some(if total == 0 {
+                    0.0
+                } else {
+                    count as f64 / total as f64
+                });
+            }
         }
     }
     Ok(rows)
 }
 
+fn repeat_path_edge(
+    link: &Link,
+    repeat_node: &str,
+    index: usize,
+) -> Result<RepeatPathEdge, OrgraftError> {
+    let (endpoint_name, endpoint_orient) = if link.from_name == repeat_node {
+        if link.from_orient == '+' {
+            (link.to_name.clone(), link.to_orient)
+        } else {
+            (link.to_name.clone(), flip_orient(link.to_orient))
+        }
+    } else if link.to_name == repeat_node {
+        if link.to_orient == '+' {
+            (link.from_name.clone(), link.from_orient)
+        } else {
+            (link.from_name.clone(), flip_orient(link.from_orient))
+        }
+    } else {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "link {index} does not touch repeat node `{repeat_node}`"
+        )));
+    };
+    let endpoint_side = link_endpoint_side(link, &endpoint_name).ok_or_else(|| {
+        OrgraftError::InvalidArgument(format!(
+            "link {index} does not expose endpoint `{endpoint_name}`"
+        ))
+    })?;
+    Ok(RepeatPathEdge {
+        index,
+        endpoint_name,
+        endpoint_orient,
+        endpoint_side,
+        support: link_support(link),
+        overlap: gfa_overlap_bases(&link.overlap),
+    })
+}
+
+fn spell_repeat_path_template(
+    gfa: &Gfa,
+    repeat_node: &str,
+    left: &RepeatPathEdge,
+    right: &RepeatPathEdge,
+) -> Result<(String, usize, usize), OrgraftError> {
+    let left_sequence = oriented_segment_sequence(gfa, &left.endpoint_name, left.endpoint_orient)?;
+    let repeat_sequence = oriented_segment_sequence(gfa, repeat_node, '+')?;
+    let right_sequence =
+        oriented_segment_sequence(gfa, &right.endpoint_name, right.endpoint_orient)?;
+    let left_overlap = left
+        .overlap
+        .min(left_sequence.len())
+        .min(repeat_sequence.len());
+    let right_overlap = right
+        .overlap
+        .min(right_sequence.len())
+        .min(repeat_sequence.len());
+    let left_take = (REPEAT_PATH_TEMPLATE_FLANK_BP + left_overlap).min(left_sequence.len());
+    let right_take = (REPEAT_PATH_TEMPLATE_FLANK_BP + right_overlap).min(right_sequence.len());
+    let left_chunk = &left_sequence[left_sequence.len() - left_take..];
+    let right_chunk = &right_sequence[..right_take];
+
+    let mut sequence =
+        String::with_capacity(left_chunk.len() + repeat_sequence.len() + right_chunk.len());
+    sequence.push_str(left_chunk);
+    sequence.push_str(&repeat_sequence[left_overlap..]);
+    sequence.push_str(&right_chunk[right_overlap..]);
+
+    let repeat_start = left_chunk.len().saturating_sub(left_overlap);
+    let repeat_end = left_chunk.len() + repeat_sequence.len().saturating_sub(left_overlap);
+    let left_required = REPEAT_PATH_REQUIRED_FLANK_BP.min(repeat_start);
+    let right_required = REPEAT_PATH_REQUIRED_FLANK_BP.min(sequence.len() - repeat_end);
+    Ok((
+        sequence,
+        repeat_start - left_required,
+        repeat_end + right_required,
+    ))
+}
+
+fn oriented_segment_sequence(gfa: &Gfa, name: &str, orient: char) -> Result<String, OrgraftError> {
+    let segment = gfa.segments.get(name).ok_or_else(|| {
+        OrgraftError::InvalidArgument(format!("repeat path references missing segment `{name}`"))
+    })?;
+    Ok(if orient == '+' {
+        segment.sequence.clone()
+    } else {
+        reverse_complement(&segment.sequence)
+    })
+}
+
+fn gfa_overlap_bases(value: &str) -> usize {
+    let mut number = String::new();
+    let mut overlap = 0usize;
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            number.push(character);
+            continue;
+        }
+        let length = number.parse::<usize>().unwrap_or(0);
+        if matches!(character, 'M' | '=' | 'X') {
+            overlap += length;
+        }
+        number.clear();
+    }
+    overlap
+}
+
+fn map_reads_to_repeat_paths(
+    templates: &[RepeatPathTemplate],
+    reads: &Path,
+    minimap2: &Path,
+    threads: usize,
+    paths: &OutputPaths,
+    keep_debug: bool,
+) -> Result<BTreeMap<String, Vec<String>>, OrgraftError> {
+    if templates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let temp_dir = if keep_debug {
+        paths.debug_dir.clone()
+    } else {
+        temp_work_dir("orgraft-repeat-path-support")
+    };
+    fs::create_dir_all(&temp_dir)?;
+    let targets = temp_dir.join("repeat_path_targets.fasta");
+    let mut target_file = File::create(&targets)?;
+    for template in templates {
+        write_fasta_record(&mut target_file, &template.id, &template.sequence)?;
+    }
+    let output = Command::new(minimap2)
+        .args([
+            "-x",
+            "map-hifi",
+            "-c",
+            "--eqx",
+            "--secondary=yes",
+            "-N",
+            "50",
+            "-t",
+            &threads.max(1).to_string(),
+        ])
+        .arg(&targets)
+        .arg(reads)
+        .output()
+        .map_err(|error| {
+            OrgraftError::InvalidArgument(format!(
+                "failed to map reads for repeat path support: {error}"
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if keep_debug {
+        fs::write(paths.debug_dir.join("repeat_path_support.paf"), &stdout)?;
+        fs::write(
+            paths.debug_dir.join("repeat_path_support.stderr.log"),
+            &stderr,
+        )?;
+    }
+    if !output.status.success() {
+        if !keep_debug {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        return Err(OrgraftError::InvalidArgument(format!(
+            "minimap2 repeat path support mapping failed: {stderr}"
+        )));
+    }
+
+    let by_id = templates
+        .iter()
+        .map(|template| (template.id.as_str(), template))
+        .collect::<HashMap<_, _>>();
+    let mut by_read_repeat = BTreeMap::<(String, String), Vec<RepeatPathAlignment>>::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let alignment = parse_repeat_path_paf(line)?;
+        let Some(template) = by_id.get(alignment.target_id.as_str()) else {
+            continue;
+        };
+        let tolerance = REPEAT_PATH_ALIGNMENT_TOLERANCE_BP;
+        if alignment.identity() < REPEAT_PATH_MIN_IDENTITY
+            || alignment.target_start > template.required_start.saturating_add(tolerance)
+            || alignment.target_end.saturating_add(tolerance) < template.required_end
+        {
+            continue;
+        }
+        by_read_repeat
+            .entry((alignment.read_id.clone(), template.repeat_node.clone()))
+            .or_default()
+            .push(alignment);
+    }
+
+    let mut support = BTreeMap::<String, Vec<String>>::new();
+    for ((read_id, _), alignments) in by_read_repeat {
+        let mut best_by_target = BTreeMap::<String, RepeatPathAlignment>::new();
+        for alignment in alignments {
+            let replace = best_by_target
+                .get(&alignment.target_id)
+                .is_none_or(|old| repeat_path_alignment_better(&alignment, old));
+            if replace {
+                best_by_target.insert(alignment.target_id.clone(), alignment);
+            }
+        }
+        let mut candidates = best_by_target.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            repeat_path_alignment_order(right, left)
+                .then_with(|| left.target_id.cmp(&right.target_id))
+        });
+        let Some(best) = candidates.first() else {
+            continue;
+        };
+        if candidates.get(1).is_some_and(|second| {
+            best.matches.abs_diff(second.matches) <= 20
+                && best.target_span().abs_diff(second.target_span()) <= 50
+        }) {
+            continue;
+        }
+        support
+            .entry(best.target_id.clone())
+            .or_default()
+            .push(read_id);
+    }
+    if !keep_debug {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    Ok(support)
+}
+
+fn parse_repeat_path_paf(line: &str) -> Result<RepeatPathAlignment, OrgraftError> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 12 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "malformed repeat path PAF line: {line}"
+        )));
+    }
+    Ok(RepeatPathAlignment {
+        read_id: fields[0].to_string(),
+        target_id: fields[5].to_string(),
+        query_start: parse_usize_value(fields[2], "PAF query start")?,
+        query_end: parse_usize_value(fields[3], "PAF query end")?,
+        target_start: parse_usize_value(fields[7], "PAF target start")?,
+        target_end: parse_usize_value(fields[8], "PAF target end")?,
+        matches: parse_usize_value(fields[9], "PAF matches")?,
+        mapq: parse_usize_value(fields[11], "PAF mapq")?,
+        primary: fields.iter().any(|field| *field == "tp:A:P"),
+    })
+}
+
+fn repeat_path_alignment_better(left: &RepeatPathAlignment, right: &RepeatPathAlignment) -> bool {
+    repeat_path_alignment_order(left, right) == Ordering::Greater
+}
+
+fn repeat_path_alignment_order(
+    left: &RepeatPathAlignment,
+    right: &RepeatPathAlignment,
+) -> Ordering {
+    left.matches
+        .cmp(&right.matches)
+        .then_with(|| left.target_span().cmp(&right.target_span()))
+        .then_with(|| left.primary.cmp(&right.primary))
+        .then_with(|| left.mapq.cmp(&right.mapq))
+}
+
+fn write_repeat_path_support(
+    path: &Path,
+    rows: &[RepeatPathSupportRow],
+) -> Result<(), OrgraftError> {
+    let mut output = String::from(
+        "repeat_node\tpath\tleft_endpoint\tright_endpoint\tmethod\tspanning_reads\tpath_ratio\tread_ids\n",
+    );
+    let mut counters = BTreeMap::<&str, usize>::new();
+    for row in rows {
+        let counter = counters.entry(&row.repeat_node).or_default();
+        *counter += 1;
+        writeln!(
+            output,
+            "{}\tp{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.repeat_node,
+            counter,
+            row.left_endpoint,
+            row.right_endpoint,
+            row.support_method,
+            optional_usize(row.path_support),
+            optional_f64(row.path_ratio),
+            if row.supporting_read_ids.is_empty() {
+                ".".to_string()
+            } else {
+                row.supporting_read_ids.join(",")
+            },
+        )
+        .unwrap();
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_repeat_resolution(
+    path: &Path,
+    outcome: Option<&RepeatResolutionOutcome>,
+) -> Result<(), OrgraftError> {
+    let mut output = String::from(
+        "section\titem\tpairing_signature\tselected\tscore\tcontinuous_fraction\tdetails\n",
+    );
+    let Some(outcome) = outcome else {
+        output.push_str("summary\tdisabled\t.\tNo\t.\t.\trepeat resolution not requested\n");
+        fs::write(path, output)?;
+        return Ok(());
+    };
+    writeln!(
+        output,
+        "summary\t{}\t{}\tYes\t{}\t{}\tmethod={};source_candidate={};local_candidate={};selected_paths={};selected_support={};alternative_support={};orientation={};rotation_offset={};exact_position_matches={};ordered_nodes={};oriented_nodes={}",
+        outcome.decision.repeat_node,
+        outcome.decision.pairing_signature,
+        optional_f64(outcome.score),
+        optional_f64(outcome.continuous_fraction),
+        outcome.selection_method,
+        outcome.selected_candidate,
+        outcome.local_candidate,
+        outcome.decision.selected_paths.join(","),
+        outcome.decision.selected_support,
+        outcome.decision.alternative_support,
+        outcome.orientation,
+        outcome.rotation_offset,
+        outcome.exact_position_matches,
+        outcome.ordered_nodes.join(","),
+        outcome.oriented_nodes.join(","),
+    )
+    .unwrap();
+    for candidate in &outcome.candidates {
+        writeln!(
+            output,
+            "candidate\t{}\t{}\t{}\t{}\t{}\tfiltered_candidate_count={};total_candidate_count={}",
+            candidate.candidate,
+            candidate.pairing_signature,
+            if candidate.selected { "Yes" } else { "No" },
+            optional_f64(candidate.score),
+            optional_f64(candidate.continuous_fraction),
+            outcome.filtered_candidate_count,
+            outcome.candidate_count,
+        )
+        .unwrap();
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
 fn attach_repeat_path_support_paths(gfa: &mut Gfa, rows: &[RepeatPathSupportRow]) {
     gfa.other_lines
         .retain(|fields| fields.first().map(String::as_str) != Some("P"));
+    let mut methods = BTreeMap::<&str, &str>::new();
+    for row in rows {
+        methods.insert(
+            &row.repeat_node,
+            if row.path_support.is_some() {
+                "spanning_reads"
+            } else {
+                "unavailable"
+            },
+        );
+    }
+    for (node, method) in methods {
+        if let Some(segment) = gfa.segments.get_mut(node) {
+            segment.tags = replace_tag(&segment.tags, format!("PM:Z:{method}"));
+        }
+    }
+
     let mut counters: BTreeMap<&str, usize> = BTreeMap::new();
     for row in rows {
-        if row.left_edge_index.is_none() || row.right_edge_index.is_none() {
+        let (Some(_), Some(_), Some(path_support)) =
+            (row.left_edge_index, row.right_edge_index, row.path_support)
+        else {
             continue;
-        }
+        };
         let counter = counters.entry(&row.repeat_node).or_default();
         *counter += 1;
         let path_index = format!("p{counter}");
@@ -3038,8 +3844,8 @@ fn attach_repeat_path_support_paths(gfa: &mut Gfa, rows: &[RepeatPathSupportRow]
             format!("RN:Z:{}", row.repeat_node),
             format!("PI:Z:{path_index}"),
             format!("RS:Z:{}", row.repeat_status),
-            format!("PM:Z:{}", row.support_method),
-            format!("RC:f:{:.3}", row.path_support.unwrap_or(0.0)),
+            "PM:Z:spanning_reads".to_string(),
+            format!("RC:i:{path_support}"),
             format!("PR:f:{:.6}", row.path_ratio.unwrap_or(0.0)),
             format!("LE:Z:{}", row.left_endpoint),
             format!("RE:Z:{}", row.right_endpoint),
@@ -3196,16 +4002,72 @@ fn dedupe_hits(mut hits: Vec<PafHit>, reference_len: usize) -> Vec<PafHit> {
     sort_hits(&mut hits);
     let mut out: Vec<PafHit> = Vec::new();
     for hit in hits {
-        if out.iter().any(|old| {
-            let a = old.folded(reference_len);
-            let b = hit.folded(reference_len);
-            a.start == b.start && a.end == b.end && a.wraps == b.wraps && old.strand == hit.strand
-        }) {
+        if out
+            .iter()
+            .any(|old| hits_share_circular_placement(old, &hit, reference_len))
+        {
             continue;
         }
         out.push(hit);
     }
     out
+}
+
+fn hits_share_circular_placement(left: &PafHit, right: &PafHit, reference_len: usize) -> bool {
+    if left.strand != right.strand {
+        return false;
+    }
+    let query_overlap = left
+        .query_end
+        .min(right.query_end)
+        .saturating_sub(left.query_start.max(right.query_start));
+    let min_query_span = left
+        .query_end
+        .saturating_sub(left.query_start)
+        .min(right.query_end.saturating_sub(right.query_start));
+    if min_query_span == 0 || query_overlap.saturating_mul(100) < min_query_span.saturating_mul(90)
+    {
+        return false;
+    }
+
+    let left_folded = left.folded(reference_len);
+    let right_folded = right.folded(reference_len);
+    let target_overlap = folded_interval_overlap(&left_folded, &right_folded, reference_len);
+    let min_target_span = folded_interval_len(&left_folded, reference_len)
+        .min(folded_interval_len(&right_folded, reference_len));
+    min_target_span > 0 && target_overlap.saturating_mul(100) >= min_target_span.saturating_mul(90)
+}
+
+fn folded_interval_overlap(
+    left: &FoldedInterval,
+    right: &FoldedInterval,
+    reference_len: usize,
+) -> usize {
+    folded_interval_parts(left, reference_len)
+        .into_iter()
+        .flat_map(|left_part| {
+            folded_interval_parts(right, reference_len)
+                .into_iter()
+                .map(move |right_part| {
+                    interval_overlap(left_part.0, left_part.1, right_part.0, right_part.1)
+                })
+        })
+        .sum()
+}
+
+fn folded_interval_len(interval: &FoldedInterval, reference_len: usize) -> usize {
+    folded_interval_parts(interval, reference_len)
+        .into_iter()
+        .map(|(start, end)| end.saturating_sub(start) + 1)
+        .sum()
+}
+
+fn folded_interval_parts(interval: &FoldedInterval, reference_len: usize) -> Vec<(usize, usize)> {
+    if interval.wraps {
+        vec![(interval.start, reference_len), (1, interval.end)]
+    } else {
+        vec![(interval.start, interval.end)]
+    }
 }
 
 fn read_fasta(path: &Path) -> Result<Vec<FastaRecord>, OrgraftError> {
@@ -3283,6 +4145,83 @@ fn extract_circular(sequence: &str, start: usize, end: usize) -> String {
         out.push(bytes[pos % len]);
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn normalize_repeat_constrained_sequence(
+    candidate: &str,
+    reference: &str,
+    boundary_offsets: &[usize],
+) -> Result<(String, char, usize, usize), OrgraftError> {
+    if candidate.len() != reference.len() {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "repeat-constrained candidate length {} differs from polished input length {}; validate-only handoff requires equal lengths",
+            candidate.len(),
+            reference.len()
+        )));
+    }
+    if candidate.is_empty() {
+        return Err(OrgraftError::InvalidArgument(
+            "cannot normalize an empty repeat-constrained sequence".to_string(),
+        ));
+    }
+
+    let reverse_candidate = reverse_complement(candidate);
+    let mut plus_offsets = boundary_offsets
+        .iter()
+        .map(|offset| offset % candidate.len())
+        .collect::<Vec<_>>();
+    plus_offsets.push(0);
+    plus_offsets.sort_unstable();
+    plus_offsets.dedup();
+    let mut minus_offsets = plus_offsets
+        .iter()
+        .map(|offset| (candidate.len() - offset) % candidate.len())
+        .collect::<Vec<_>>();
+    minus_offsets.sort_unstable();
+    minus_offsets.dedup();
+
+    let mut best: Option<(usize, char, usize, String)> = None;
+    for (orientation, oriented_candidate) in [('+', candidate), ('-', reverse_candidate.as_str())] {
+        let offsets = if orientation == '+' {
+            &plus_offsets
+        } else {
+            &minus_offsets
+        };
+        for rotation in offsets {
+            let normalized = rotate_sequence_left(oriented_candidate, *rotation);
+            let exact_matches = normalized
+                .bytes()
+                .zip(reference.bytes())
+                .filter(|(left, right)| left == right)
+                .count();
+            let candidate_key = (exact_matches, orientation, *rotation, normalized);
+            let replace = best.as_ref().is_none_or(|current| {
+                candidate_key.0 > current.0
+                    || (candidate_key.0 == current.0 && candidate_key.1 == '+' && current.1 == '-')
+                    || (candidate_key.0 == current.0
+                        && candidate_key.1 == current.1
+                        && candidate_key.2 < current.2)
+            });
+            if replace {
+                best = Some(candidate_key);
+            }
+        }
+    }
+
+    best.map(|(matches, orientation, rotation, normalized)| {
+        (normalized, orientation, rotation, matches)
+    })
+    .ok_or_else(|| {
+        OrgraftError::InvalidArgument(
+            "repeat-constrained candidate has no graph-node boundary available for circular normalization"
+                .to_string(),
+        )
+    })
+}
+
+fn rotate_sequence_left(sequence: &str, offset: usize) -> String {
+    let offset = offset % sequence.len();
+    format!("{}{}", &sequence[offset..], &sequence[..offset])
 }
 
 fn reverse_complement(sequence: &str) -> String {
@@ -3492,16 +4431,6 @@ fn link_endpoint_side(link: &Link, node: &str) -> Option<char> {
     }
 }
 
-fn other_link_endpoint(link: &Link, node: &str) -> String {
-    if link.from_name == node {
-        format!("{}{}", link.to_name, link.to_orient)
-    } else if link.to_name == node {
-        format!("{}{}", link.from_name, link.from_orient)
-    } else {
-        ".".to_string()
-    }
-}
-
 fn natural_cmp(left: &str, right: &str) -> Ordering {
     natural_key(left).cmp(&natural_key(right))
 }
@@ -3574,6 +4503,8 @@ mod tests {
             "graph.gfa".to_string(),
             "--polished-fasta".to_string(),
             "final.fa".to_string(),
+            "--reads".to_string(),
+            "reads.fastq.gz".to_string(),
             "--image-reference-fasta".to_string(),
             "bait.fa".to_string(),
             "--out-dir".to_string(),
@@ -3582,6 +4513,7 @@ mod tests {
         let options = RebuildOptions::from_args(&args).unwrap();
         assert_eq!(options.edited_gfa, PathBuf::from("graph.gfa"));
         assert_eq!(options.polished_fasta, PathBuf::from("final.fa"));
+        assert_eq!(options.reads, Some(PathBuf::from("reads.fastq.gz")));
         assert_eq!(
             options.image_reference_fasta,
             Some(PathBuf::from("bait.fa"))
@@ -3688,6 +4620,215 @@ mod tests {
     #[test]
     fn extracts_circular_sequence() {
         assert_eq!(extract_circular("ABCDEF", 4, 8), "EFAB");
+    }
+
+    #[test]
+    fn repeat_path_endpoints_are_oriented_for_repeat_plus_traversal() {
+        let incoming_reverse = Link {
+            from_name: "repeat".to_string(),
+            from_orient: '-',
+            to_name: "left".to_string(),
+            to_orient: '+',
+            overlap: "0M".to_string(),
+            tags: Vec::new(),
+        };
+        let outgoing_reverse = Link {
+            from_name: "right".to_string(),
+            from_orient: '+',
+            to_name: "repeat".to_string(),
+            to_orient: '-',
+            overlap: "0M".to_string(),
+            tags: Vec::new(),
+        };
+
+        assert_eq!(link_endpoint_side(&incoming_reverse, "repeat"), Some('-'));
+        assert_eq!(
+            repeat_path_edge(&incoming_reverse, "repeat", 1)
+                .unwrap()
+                .label(),
+            "left-"
+        );
+        assert_eq!(link_endpoint_side(&outgoing_reverse, "repeat"), Some('+'));
+        assert_eq!(
+            repeat_path_edge(&outgoing_reverse, "repeat", 2)
+                .unwrap()
+                .label(),
+            "right-"
+        );
+    }
+
+    #[test]
+    fn repeat_path_records_use_integer_spanning_read_support() {
+        let mut gfa = test_gfa(&[("left", "AC"), ("repeat", "GT"), ("right", "TA")]);
+        gfa.segments.get_mut("repeat").unwrap().tags =
+            vec!["PM:Z:repeat_path_support_pending".to_string()];
+        let rows = vec![RepeatPathSupportRow {
+            repeat_node: "repeat".to_string(),
+            repeat_status: "unresolved".to_string(),
+            support_method: "spanning_reads".to_string(),
+            left_edge_index: Some(1),
+            right_edge_index: Some(2),
+            left_endpoint: "left+".to_string(),
+            right_endpoint: "right+".to_string(),
+            left_physical_endpoint: "left+".to_string(),
+            right_physical_endpoint: "right+".to_string(),
+            left_support: Some(100.0),
+            right_support: Some(90.0),
+            path_support: Some(17),
+            path_ratio: Some(1.0),
+            supporting_read_ids: vec!["read_1".to_string()],
+        }];
+
+        attach_repeat_path_support_paths(&mut gfa, &rows);
+
+        assert!(gfa.segments["repeat"]
+            .tags
+            .contains(&"PM:Z:spanning_reads".to_string()));
+        assert_eq!(gfa.other_lines.len(), 1);
+        assert!(gfa.other_lines[0].contains(&"RC:i:17".to_string()));
+        assert!(gfa.other_lines[0].contains(&"PM:Z:spanning_reads".to_string()));
+    }
+
+    #[test]
+    fn dominant_repeat_pairing_uses_complete_spanning_read_counts() {
+        let make_row = |left_edge_index,
+                        right_edge_index,
+                        left_endpoint: &str,
+                        right_endpoint: &str,
+                        path_support| RepeatPathSupportRow {
+            repeat_node: "utg5".to_string(),
+            repeat_status: "unresolved".to_string(),
+            support_method: "spanning_reads".to_string(),
+            left_edge_index: Some(left_edge_index),
+            right_edge_index: Some(right_edge_index),
+            left_endpoint: left_endpoint.to_string(),
+            right_endpoint: right_endpoint.to_string(),
+            left_physical_endpoint: left_endpoint.to_string(),
+            right_physical_endpoint: right_endpoint.to_string(),
+            left_support: Some(path_support as f64),
+            right_support: Some(path_support as f64),
+            path_support: Some(path_support),
+            path_ratio: None,
+            supporting_read_ids: Vec::new(),
+        };
+        let rows = vec![
+            make_row(1, 3, "long+", "utg1+", 242),
+            make_row(1, 4, "long+", "utg7+", 4),
+            make_row(2, 3, "utg2+", "utg1+", 6),
+            make_row(2, 4, "utg2+", "utg7+", 223),
+        ];
+
+        let decision = select_dominant_repeat_pairing(&rows, "utg5").unwrap();
+
+        assert_eq!(decision.selected_paths, vec!["p1", "p4"]);
+        assert_eq!(decision.selected_support, 465);
+        assert_eq!(decision.alternative_support, 10);
+        assert_eq!(decision.pairing_signature, "long+--utg1+|utg2+--utg7+");
+    }
+
+    #[test]
+    fn final_rebuild_preserves_the_initial_candidate_id_as_provenance() {
+        let base = temp_work_dir("orgraft-repeat-candidate-provenance");
+        let paths = OutputPaths::new(&base, "subgraph_001");
+        paths.create(false).unwrap();
+        fs::write(
+            &paths.result_stats,
+            "section\tsubgraph\titem\tmetric\tvalue\textra\nsummary\tsubgraph_001\t.\trepeat_resolution_node\tutg5\t.\nsummary\tsubgraph_001\t.\trepeat_resolution_candidate\tauto_repeat_003\t.\n",
+        )
+        .unwrap();
+        fs::write(
+            &paths.repeat_resolution,
+            "section\titem\tpairing_signature\tselected\tscore\tcontinuous_fraction\tdetails\nsummary\tutg5\tlong+--utg1+|utg2+--utg7+\tYes\t.\t.\tmethod=unique_after_pairing_filter\n",
+        )
+        .unwrap();
+
+        let prior = read_prior_repeat_resolution(&paths, "utg5").unwrap();
+        let decision = RepeatResolutionDecision {
+            repeat_node: "utg5".to_string(),
+            pairing_signature: "long+--utg1+|utg2+--utg7+".to_string(),
+            selected_paths: vec!["p1".to_string(), "p4".to_string()],
+            selected_support: 482,
+            alternative_support: 12,
+        };
+
+        assert_eq!(
+            source_repeat_candidate(Some(&prior), &decision, "auto_repeat_002"),
+            "auto_repeat_003"
+        );
+        let mut changed = decision.clone();
+        changed.pairing_signature = "long+--utg7+|utg2+--utg1+".to_string();
+        assert_eq!(
+            source_repeat_candidate(Some(&prior), &changed, "auto_repeat_002"),
+            "auto_repeat_002"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn repeat_path_identity_does_not_penalize_template_only_gap_length() {
+        let alignment = RepeatPathAlignment {
+            read_id: "read_1".to_string(),
+            target_id: "repeat_path_0001".to_string(),
+            query_start: 3_436,
+            query_end: 7_876,
+            target_start: 0,
+            target_end: 4_953,
+            matches: 4_436,
+            mapq: 60,
+            primary: true,
+        };
+
+        assert!(alignment.identity() > 0.99);
+        assert!(alignment.identity() >= REPEAT_PATH_MIN_IDENTITY);
+    }
+
+    #[test]
+    fn repeat_candidate_normalization_keeps_a_graph_node_boundary() {
+        let candidate = "AAAACCGT";
+        let reference = "AACCGTAA";
+
+        let (normalized, _, rotation, exact_matches) =
+            normalize_repeat_constrained_sequence(candidate, reference, &[0, 4]).unwrap();
+
+        assert!(matches!(rotation, 0 | 4));
+        assert_ne!(normalized, reference);
+        assert!(exact_matches < candidate.len());
+    }
+
+    #[test]
+    fn circular_projection_dedupes_wrap_and_truncated_same_placement() {
+        let make_hit = |query_start, query_end, target_start, target_end| PafHit {
+            query_name: "long_node".to_string(),
+            query_length: 243_451,
+            query_start,
+            query_end,
+            strand: '+',
+            target_start,
+            target_end,
+            matches: query_end - query_start,
+            block_length: query_end - query_start,
+            mapq: 60,
+            primary: query_start == 0,
+        };
+        let reference_len = 339_849;
+        let wrap = make_hit(0, 243_451, 339_554, 580_840);
+        let truncated = make_hit(295, 243_451, 0, 240_991);
+
+        assert!(hits_share_circular_placement(
+            &wrap,
+            &truncated,
+            reference_len
+        ));
+        assert_eq!(dedupe_hits(vec![truncated, wrap], reference_len).len(), 1);
+
+        let first_copy = make_hit(0, 1_000, 10_000, 11_000);
+        let second_copy = make_hit(0, 1_000, 40_000, 41_000);
+        assert!(!hits_share_circular_placement(
+            &first_copy,
+            &second_copy,
+            reference_len
+        ));
     }
 
     #[test]
