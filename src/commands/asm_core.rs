@@ -1178,7 +1178,7 @@ fn run_two_round_skeleton_workflow(config: &Config, started: Instant) -> io::Res
             config,
             &bridge_rescue_dir,
             "skipped",
-            "low-depth bridge rescue is not required for repeat-aware mito workflow",
+            "low-depth bridge rescue is not required for repeat-aware stable workflow",
             &read_junction_dir,
             &link_evidence_dir,
             false,
@@ -2198,7 +2198,7 @@ fn write_profile_parameter_report(path: &Path, config: &Config) -> io::Result<()
         standard.mito_stable.to_string(),
         config.mito_stable.to_string(),
         "",
-        "unstable mitogenome additional parameter enables repeat-aware resolution",
+        "opt-in stable parameter enables repeat-aware topology resolution",
     )?;
     write_profile_parameter_row(
         &mut out,
@@ -2507,9 +2507,8 @@ impl Config {
             DraftOrganelle::Plastid => OrganelleProfile::Plastid,
         });
         if request.repeat_aware_resolution {
-            if organelle != DraftOrganelle::Mito {
-                return Err("repeat-aware resolution is only available for mito".to_string());
-            }
+            // Keep the legacy internal field name while sharing the same
+            // repeat-aware stable engine between mitochondrial and plastid runs.
             config.mito_stable = true;
         }
 
@@ -3135,9 +3134,6 @@ fn apply_profiles(config: &mut Config, overrides: &OverrideFlags) {
 
 fn apply_mito_stable_profile(config: &mut Config, overrides: &OverrideFlags) {
     if !config.mito_stable {
-        return;
-    }
-    if config.organelle != Some(OrganelleProfile::Mito) {
         return;
     }
     if !overrides.rounds {
@@ -8472,7 +8468,7 @@ fn write_mito_stable_bridge_report(
     writeln!(out, "status\tresolved")?;
     writeln!(
         out,
-        "reason\trepeat-aware mito workflow resolved candidate links and topology repairs"
+        "reason\trepeat-aware stable workflow resolved candidate links and topology repairs"
     )?;
     writeln!(out, "input_dir\t{}", input_dir.display())?;
     writeln!(out, "output_dir\t{}", config.out_dir.display())?;
@@ -9860,6 +9856,38 @@ mod tests {
         assert!((config.skeleton_min_link_ratio - 0.20).abs() < f64::EPSILON);
         assert_eq!(config.skeleton_rescue_link_support, 20);
         assert_eq!(config.threads, 4);
+    }
+
+    #[test]
+    fn draft_request_plastid_stable_uses_repeat_aware_two_round_defaults() {
+        let config = Config::from_draft_request(DraftAssemblyRequest {
+            organelle: DraftOrganelle::Plastid,
+            data_mode: DraftDataMode::Standard,
+            auto_read_subset: false,
+            repeat_aware_resolution: true,
+            reads: vec![PathBuf::from("reads.fastq.gz")],
+            out_dir: PathBuf::from("draft_asm/plastid/02.anchor_graph_core"),
+            threads: 2,
+            min_graph_coverage: None,
+            min_branch_ratio: None,
+            min_tip_len: None,
+            min_link_support: None,
+            min_link_ratio: None,
+            read_subsets: None,
+            keep_debug_files: false,
+        })
+        .unwrap();
+
+        assert_eq!(config.organelle, Some(OrganelleProfile::Plastid));
+        assert_eq!(config.data_mode, DataMode::Standard);
+        assert_eq!(config.rounds, 2);
+        assert!(config.mito_stable);
+        assert!(config.bidirectional_links);
+        assert_eq!(graph_workflow_label(&config), "repeat_aware_skeleton_link");
+        assert_eq!(config.min_anchor_coverage, 18);
+        assert_eq!(config.min_edge_coverage, 18);
+        assert!((config.min_branch_ratio - 0.30).abs() < f64::EPSILON);
+        assert_eq!(config.threads, 2);
     }
 
     #[test]

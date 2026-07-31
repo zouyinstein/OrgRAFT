@@ -79,7 +79,7 @@ Use `--finalize-dedup-rc-links off` to publish the selected graph unchanged.
 Each run writes exact active values to 08.workflow_summary/profile_parameters.tsv
 
 Advanced parameters:
-  --stable                  for unstable mitogenomes; enable repeat-aware resolution
+  --stable                  opt-in repeat-aware topology resolution for mito or plastid
   --min-graph-coverage N    override shared anchor/edge coverage floor
   --min-link-ratio FLOAT    optional weak-link ratio filter
   --subsets LIST            manual read subset percent(s) for high-depth reruns
@@ -452,14 +452,6 @@ impl AsmOptions {
         let organelle = organelle.ok_or_else(|| {
             OrgraftError::InvalidArgument("missing --organelle mito|plastid".to_string())
         })?;
-        if stable {
-            if organelle != Organelle::Mito {
-                return Err(OrgraftError::InvalidArgument(
-                    "--stable is only available with --organelle mito".to_string(),
-                ));
-            }
-        }
-
         let soft_paths = read_soft_paths_optional(&soft_paths_file)?;
 
         Ok(Self {
@@ -1243,7 +1235,8 @@ profile-specific differences:
   Step 04.
 - standard: organelle defaults; plastid uses the direct-anchor workflow, mito
   uses the skeleton-link workflow.
-- `--stable`: standard plus repeat-aware resolution for unstable mitogenomes.
+- `--stable`: standard plus opt-in repeat-aware topology resolution for complex
+  mitochondrial or plastid graphs.
 - high: standard plus deterministic read-subset candidates, selected after
   assembly by topology first and posterior `read_bases / graph_bases` near
   300x. Plastid high wraps the direct-anchor workflow; mito high wraps the
@@ -1262,7 +1255,7 @@ The assembly core then:
    rescue handoff from read-junction evidence into skeleton-link selection.
 5. `05.skeleton_link_evidence`: for skeleton-link workflows, remap reads to
    skeleton unitigs and collect depth/link evidence.
-6. `06.repeat_aware_resolution`: for repeat-aware mito workflows, resolve
+6. `06.repeat_aware_resolution`: for repeat-aware stable workflows, resolve
    candidate links, copy choices, repeat expansions, and topology repairs.
 7. `07.linked_graph`: write the unified linked-graph handoff, either copied
    from the direct-anchor graph or selected from skeleton evidence.
@@ -1283,7 +1276,7 @@ finalize copy removes those reverse-complement duplicate L records by default
 so topology checks count one physical connection once. Use
 `--finalize-dedup-rc-links off` to publish the selected graph unchanged. Source
 graphs under `02.anchor_graph_core` remain unchanged for debugging and
-mito-stable analysis.
+stable topology analysis.
 "#;
     fs::write(path, text)?;
     Ok(())
@@ -1395,7 +1388,7 @@ mod tests {
         ));
         assert!(!HELP.contains("<out-dir>/<organelle>/03.finalize_graph/graph.gfa"));
         assert!(!HELP.contains("Workflow frame:"));
-        assert!(!HELP.contains("--stable                  for unstable mitogenomes"));
+        assert!(!HELP.contains("--stable"));
         assert!(!HELP.contains("Profiles are presets on one 01-08 workflow frame"));
     }
 
@@ -1406,7 +1399,9 @@ mod tests {
         assert!(PROFILE_HELP.contains("03.finalize_graph publishes the selected graph"));
         assert!(PROFILE_HELP.contains("--finalize-dedup-rc-links on|off"));
         assert!(PROFILE_HELP.contains("--image-reference-fasta FILE"));
-        assert!(PROFILE_HELP.contains("--stable                  for unstable mitogenomes"));
+        assert!(PROFILE_HELP.contains(
+            "--stable                  opt-in repeat-aware topology resolution for mito or plastid"
+        ));
         assert!(PROFILE_HELP.contains("--keep-debug-files"));
     }
 
@@ -1591,19 +1586,19 @@ mod tests {
     }
 
     #[test]
-    fn stable_rejects_plastid() {
-        let err = AsmOptions::from_args(&[
+    fn stable_is_plastid_additional_step() {
+        let options = AsmOptions::from_args(&[
             "--reads".to_string(),
             "plastid.fastq.gz".to_string(),
             "--organelle".to_string(),
             "plastid".to_string(),
             "--stable".to_string(),
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("--stable is only available with --organelle mito"));
+        assert_eq!(options.input.organelle, Organelle::Plastid);
+        assert_eq!(options.input.profile, AsmProfile::Standard);
+        assert!(options.input.repeat_aware_resolution);
     }
 
     fn test_dir(name: &str) -> PathBuf {

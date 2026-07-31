@@ -148,6 +148,20 @@ struct BlockToken {
     orient: char,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Crossover {
+    source: usize,
+    source_orient: char,
+    target: usize,
+    target_orient: char,
+}
+
+#[derive(Debug)]
+struct CandidateLayout {
+    blocks: Vec<Block>,
+    forced_edges: Vec<(BlockToken, BlockToken)>,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateDescriptor {
     tokens: Vec<BlockToken>,
@@ -1022,81 +1036,11 @@ fn generate_candidates(
     }));
     let representative = choose_representative(&selected_by_read)?;
     let normalized = normalize_representative(representative)?;
-    let forced_coordinates = forced_coordinates(&normalized, reference.len())?;
-    let outer_start = normalized
-        .first()
-        .map(|segment| segment.subject_start)
-        .ok_or_else(|| {
-            OrgraftError::InvalidArgument(
-                "selected SV subgroup has no alignment segments".to_string(),
-            )
-        })?;
-    let outer_end = normalized
-        .last()
-        .map(|segment| segment.subject_end)
-        .unwrap_or(outer_start);
-
-    let successor = |position: usize| {
-        if position == reference.len() {
-            1
-        } else {
-            position + 1
-        }
-    };
-    let mut starts = vec![1, outer_start, successor(outer_end)];
-    for &(source, target) in &forced_coordinates {
-        starts.push(successor(source));
-        starts.push(target);
-    }
-    starts.sort_unstable();
-    starts.dedup();
-    let blocks = starts
-        .iter()
-        .enumerate()
-        .map(|(index, start)| Block {
-            id: index,
-            start: *start,
-            end: if index + 1 == starts.len() {
-                reference.len()
-            } else {
-                starts[index + 1] - 1
-            },
-        })
-        .collect::<Vec<_>>();
-    let block_by_start = blocks
-        .iter()
-        .map(|block| (block.start, block.id))
-        .collect::<HashMap<_, _>>();
-    let block_by_end = blocks
-        .iter()
-        .map(|block| (block.end, block.id))
-        .collect::<HashMap<_, _>>();
-    let mut forced = HashMap::new();
-    let mut forced_in = HashMap::new();
-    for (source, target) in forced_coordinates {
-        let from = *block_by_end.get(&source).ok_or_else(|| {
-            OrgraftError::InvalidArgument(format!(
-                "SV crossover source {source} is not a block end"
-            ))
-        })?;
-        let to = *block_by_start.get(&target).ok_or_else(|| {
-            OrgraftError::InvalidArgument(format!(
-                "SV crossover target {target} is not a block start"
-            ))
-        })?;
-        if forced
-            .insert(from, to)
-            .is_some_and(|existing| existing != to)
-            || forced_in
-                .insert(to, from)
-                .is_some_and(|existing| existing != from)
-        {
-            return Err(OrgraftError::InvalidArgument(
-                "selected SV subgroup implies conflicting crossover edges".to_string(),
-            ));
-        }
-    }
-    let components = forced_components(&blocks, &forced, &forced_in)?;
+    let CandidateLayout {
+        blocks,
+        forced_edges,
+    } = candidate_layout(reference.len(), &normalized)?;
+    let components = forced_components(&blocks, &forced_edges)?;
     let read_paths = build_read_paths(segments, &blocks);
     let target_paths = target_ids
         .iter()
@@ -1106,7 +1050,7 @@ fn generate_candidates(
 
     let anchor_component = components
         .iter()
-        .position(|component| component.contains(&0))
+        .position(|component| component.iter().any(|token| token.id == 0))
         .unwrap_or(0);
     let mut anchored_components = components;
     let anchor = anchored_components.remove(anchor_component);
@@ -1151,19 +1095,14 @@ fn generate_candidates(
                     .position(|index| *index == component_index)
                     .is_some_and(|bit| mask & (1usize << bit) != 0);
                 if reverse {
-                    for id in component.iter().rev() {
+                    for token in component.iter().rev() {
                         tokens.push(BlockToken {
-                            id: *id,
-                            orient: '-',
+                            id: token.id,
+                            orient: flip_orient(token.orient),
                         });
                     }
                 } else {
-                    for id in component {
-                        tokens.push(BlockToken {
-                            id: *id,
-                            orient: '+',
-                        });
-                    }
+                    tokens.extend(component.iter().copied());
                 }
             }
             let key = canonical_token_key(&tokens);
@@ -1288,25 +1227,18 @@ fn choose_representative(
 }
 
 fn normalize_representative(rows: &[Segment]) -> Result<Vec<Segment>, OrgraftError> {
-    let strands = rows
-        .iter()
-        .map(|segment| segment.strand)
-        .collect::<BTreeSet<_>>();
-    if strands.len() != 1 {
+    if rows.is_empty() {
         return Err(OrgraftError::InvalidArgument(
-            "automatic SV correction currently requires a subgroup with one common strand; select a simpler subgroup or edit manually"
-                .to_string(),
+            "selected SV subgroup has no alignment segments".to_string(),
         ));
     }
-    if strands.contains(&'+') {
-        return Ok(rows.to_vec());
-    }
+
     let read_length = rows
         .iter()
         .map(|segment| segment.query_end)
         .max()
         .unwrap_or(0);
-    Ok(rows
+    let reverse = rows
         .iter()
         .rev()
         .map(|segment| Segment {
@@ -1320,15 +1252,33 @@ fn normalize_representative(rows: &[Segment]) -> Result<Vec<Segment>, OrgraftErr
             query_end: read_length - segment.query_start + 1,
             subject_start: segment.subject_end,
             subject_end: segment.subject_start,
-            strand: '+',
+            strand: flip_orient(segment.strand),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let forward = rows.to_vec();
+    if representative_orientation_key(&reverse) < representative_orientation_key(&forward) {
+        Ok(reverse)
+    } else {
+        Ok(forward)
+    }
 }
 
-fn forced_coordinates(
+fn representative_orientation_key(rows: &[Segment]) -> Vec<(u8, usize, usize)> {
+    rows.iter()
+        .map(|segment| {
+            (
+                if segment.strand == '+' { 0 } else { 1 },
+                segment.subject_start,
+                segment.subject_end,
+            )
+        })
+        .collect()
+}
+
+fn crossover_coordinates(
     rows: &[Segment],
     reference_len: usize,
-) -> Result<Vec<(usize, usize)>, OrgraftError> {
+) -> Result<Vec<Crossover>, OrgraftError> {
     let mut output = Vec::new();
     for pair in rows.windows(2) {
         let left = &pair[0];
@@ -1347,9 +1297,126 @@ fn forced_coordinates(
         };
         let source = map_query_coordinate(left, left_query).clamp(1, reference_len);
         let target = map_query_coordinate(right, right_query).clamp(1, reference_len);
-        output.push((source, target));
+        output.push(Crossover {
+            source,
+            source_orient: left.strand,
+            target,
+            target_orient: right.strand,
+        });
     }
     Ok(output)
+}
+
+fn candidate_layout(
+    reference_len: usize,
+    rows: &[Segment],
+) -> Result<CandidateLayout, OrgraftError> {
+    if reference_len == 0 {
+        return Err(OrgraftError::InvalidArgument(
+            "cannot repair an empty reference sequence".to_string(),
+        ));
+    }
+    let first = rows.first().ok_or_else(|| {
+        OrgraftError::InvalidArgument("selected SV subgroup has no alignment segments".to_string())
+    })?;
+    let last = rows.last().unwrap();
+    let crossovers = crossover_coordinates(rows, reference_len)?;
+    let successor = |position: usize| {
+        if position == reference_len {
+            1
+        } else {
+            position + 1
+        }
+    };
+    let mut starts = vec![1];
+    let outer_entry = map_query_coordinate(first, first.query_start).clamp(1, reference_len);
+    let outer_exit = map_query_coordinate(last, last.query_end).clamp(1, reference_len);
+    starts.push(if first.strand == '+' {
+        outer_entry
+    } else {
+        successor(outer_entry)
+    });
+    starts.push(if last.strand == '+' {
+        successor(outer_exit)
+    } else {
+        outer_exit
+    });
+    for crossover in &crossovers {
+        starts.push(if crossover.source_orient == '+' {
+            successor(crossover.source)
+        } else {
+            crossover.source
+        });
+        starts.push(if crossover.target_orient == '+' {
+            crossover.target
+        } else {
+            successor(crossover.target)
+        });
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    let blocks = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| Block {
+            id: index,
+            start: *start,
+            end: if index + 1 == starts.len() {
+                reference_len
+            } else {
+                starts[index + 1] - 1
+            },
+        })
+        .collect::<Vec<_>>();
+    let block_by_start = blocks
+        .iter()
+        .map(|block| (block.start, block.id))
+        .collect::<HashMap<_, _>>();
+    let block_by_end = blocks
+        .iter()
+        .map(|block| (block.end, block.id))
+        .collect::<HashMap<_, _>>();
+    let mut forced_edges = Vec::with_capacity(crossovers.len());
+    for crossover in crossovers {
+        let from = if crossover.source_orient == '+' {
+            block_by_end.get(&crossover.source)
+        } else {
+            block_by_start.get(&crossover.source)
+        }
+        .copied()
+        .ok_or_else(|| {
+            OrgraftError::InvalidArgument(format!(
+                "SV crossover source {} on strand {} is not a block exit",
+                crossover.source, crossover.source_orient
+            ))
+        })?;
+        let to = if crossover.target_orient == '+' {
+            block_by_start.get(&crossover.target)
+        } else {
+            block_by_end.get(&crossover.target)
+        }
+        .copied()
+        .ok_or_else(|| {
+            OrgraftError::InvalidArgument(format!(
+                "SV crossover target {} on strand {} is not a block entry",
+                crossover.target, crossover.target_orient
+            ))
+        })?;
+        forced_edges.push((
+            BlockToken {
+                id: from,
+                orient: crossover.source_orient,
+            },
+            BlockToken {
+                id: to,
+                orient: crossover.target_orient,
+            },
+        ));
+    }
+    Ok(CandidateLayout {
+        blocks,
+        forced_edges,
+    })
 }
 
 fn map_query_coordinate(segment: &Segment, query: usize) -> usize {
@@ -1365,9 +1432,35 @@ fn map_query_coordinate(segment: &Segment, query: usize) -> usize {
 
 fn forced_components(
     blocks: &[Block],
-    forced: &HashMap<usize, usize>,
-    forced_in: &HashMap<usize, usize>,
-) -> Result<Vec<Vec<usize>>, OrgraftError> {
+    forced_edges: &[(BlockToken, BlockToken)],
+) -> Result<Vec<Vec<BlockToken>>, OrgraftError> {
+    let mut forced = HashMap::new();
+    let mut forced_in = HashMap::new();
+    let mut orientations = HashMap::new();
+    for &(from, to) in forced_edges {
+        for token in [from, to] {
+            if orientations
+                .insert(token.id, token.orient)
+                .is_some_and(|existing| existing != token.orient)
+            {
+                return Err(OrgraftError::InvalidArgument(
+                    "selected SV subgroup uses one reference block in conflicting orientations"
+                        .to_string(),
+                ));
+            }
+        }
+        if forced
+            .insert(from.id, to.id)
+            .is_some_and(|existing| existing != to.id)
+            || forced_in
+                .insert(to.id, from.id)
+                .is_some_and(|existing| existing != from.id)
+        {
+            return Err(OrgraftError::InvalidArgument(
+                "selected SV subgroup implies conflicting crossover edges".to_string(),
+            ));
+        }
+    }
     let starts = blocks
         .iter()
         .map(|block| block.id)
@@ -1384,7 +1477,10 @@ fn forced_components(
                     "selected SV subgroup implies a forced edge cycle".to_string(),
                 ));
             }
-            component.push(current);
+            component.push(BlockToken {
+                id: current,
+                orient: orientations.get(&current).copied().unwrap_or('+'),
+            });
             let Some(next) = forced.get(&current) else {
                 break;
             };
@@ -1565,49 +1661,14 @@ fn materialize_candidate(
     }));
     let representative = choose_representative(&selected_by_read)?;
     let normalized = normalize_representative(representative)?;
-    let forced_coordinates = forced_coordinates(&normalized, reference.len())?;
-    let outer_start = normalized[0].subject_start;
-    let outer_end = normalized.last().unwrap().subject_end;
-    let successor = |position: usize| {
-        if position == reference.len() {
-            1
-        } else {
-            position + 1
-        }
-    };
-    let mut starts = vec![1, outer_start, successor(outer_end)];
-    for &(source, target) in &forced_coordinates {
-        starts.push(successor(source));
-        starts.push(target);
-    }
-    starts.sort_unstable();
-    starts.dedup();
-    let blocks = starts
+    let CandidateLayout {
+        blocks,
+        forced_edges,
+    } = candidate_layout(reference.len(), &normalized)?;
+    let forced_blocks = forced_edges
         .iter()
-        .enumerate()
-        .map(|(index, start)| Block {
-            id: index,
-            start: *start,
-            end: if index + 1 == starts.len() {
-                reference.len()
-            } else {
-                starts[index + 1] - 1
-            },
-        })
-        .collect::<Vec<_>>();
-    let block_by_start = blocks
-        .iter()
-        .map(|block| (block.start, block.id))
-        .collect::<HashMap<_, _>>();
-    let block_by_end = blocks
-        .iter()
-        .map(|block| (block.end, block.id))
-        .collect::<HashMap<_, _>>();
-    let mut forced_blocks = HashSet::new();
-    for (source, target) in forced_coordinates {
-        forced_blocks.insert(*block_by_end.get(&source).unwrap());
-        forced_blocks.insert(*block_by_start.get(&target).unwrap());
-    }
+        .flat_map(|(from, to)| [from.id, to.id])
+        .collect::<HashSet<_>>();
 
     let token_sequences = descriptor
         .tokens
@@ -2126,6 +2187,144 @@ mod tests {
     }
 
     #[test]
+    fn mixed_strand_reciprocal_paths_share_one_oriented_layout() {
+        let forward = vec![
+            test_segment(1, 3, 1, 20, 11, 30, '+'),
+            test_segment(2, 3, 21, 30, 70, 61, '-'),
+            test_segment(3, 3, 31, 50, 41, 60, '+'),
+        ];
+        let reciprocal = vec![
+            test_segment(1, 3, 1, 20, 60, 41, '-'),
+            test_segment(2, 3, 21, 30, 61, 70, '+'),
+            test_segment(3, 3, 31, 50, 30, 11, '-'),
+        ];
+        let normalized_forward = normalize_representative(&forward).unwrap();
+        let normalized_reciprocal = normalize_representative(&reciprocal).unwrap();
+        assert_eq!(
+            normalized_forward
+                .iter()
+                .map(|segment| (segment.subject_start, segment.subject_end, segment.strand))
+                .collect::<Vec<_>>(),
+            normalized_reciprocal
+                .iter()
+                .map(|segment| (segment.subject_start, segment.subject_end, segment.strand))
+                .collect::<Vec<_>>()
+        );
+
+        let layout = candidate_layout(100, &normalized_forward).unwrap();
+        assert_eq!(
+            layout
+                .blocks
+                .iter()
+                .map(|block| (block.start, block.end))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (11, 30), (31, 40), (41, 60), (61, 70), (71, 100)]
+        );
+        assert_eq!(
+            layout.forced_edges,
+            vec![
+                (
+                    BlockToken { id: 1, orient: '+' },
+                    BlockToken { id: 4, orient: '-' }
+                ),
+                (
+                    BlockToken { id: 4, orient: '-' },
+                    BlockToken { id: 3, orient: '+' }
+                ),
+            ]
+        );
+        let components = forced_components(&layout.blocks, &layout.forced_edges).unwrap();
+        assert!(components.contains(&vec![
+            BlockToken { id: 1, orient: '+' },
+            BlockToken { id: 4, orient: '-' },
+            BlockToken { id: 3, orient: '+' },
+        ]));
+
+        let selected = HighSubgroup {
+            group_name: "type_3_subtype_rep_rep_NA".to_string(),
+            old_index: 3,
+            boundary_key: "synthetic".to_string(),
+            subgroup_reads: 1,
+            is_reference_support: false,
+            auto_highlight: true,
+            min_reference_fraction: 0.0,
+            judgement: "possible_reference_sv_error".to_string(),
+        };
+        let target_ids = HashSet::from(["read".to_string()]);
+        let generated =
+            generate_candidates(&"A".repeat(100), &forward, &selected, &target_ids).unwrap();
+        let supported = generated
+            .iter()
+            .find(|candidate| candidate.predicted_target_reads == 1)
+            .unwrap();
+        let materialized =
+            materialize_candidate(&"ACGT".repeat(25), supported, &selected, &forward).unwrap();
+        assert_eq!(materialized.len(), 100);
+    }
+
+    #[test]
+    fn b2s044_mixed_strand_junctions_keep_signed_endpoints() {
+        let rows = vec![
+            test_segment(1, 3, 1, 5_181, 17_980, 23_160, '+'),
+            test_segment(2, 3, 4_761, 5_395, 260_253, 259_619, '-'),
+            test_segment(3, 3, 4_931, 7_648, 125_201, 127_919, '+'),
+        ];
+        assert_eq!(
+            crossover_coordinates(&rows, 289_145).unwrap(),
+            vec![
+                Crossover {
+                    source: 22_950,
+                    source_orient: '+',
+                    target: 260_042,
+                    target_orient: '-',
+                },
+                Crossover {
+                    source: 259_851,
+                    source_orient: '-',
+                    target: 125_434,
+                    target_orient: '+',
+                },
+            ]
+        );
+        let layout = candidate_layout(289_145, &rows).unwrap();
+        assert_eq!(
+            layout
+                .blocks
+                .iter()
+                .map(|block| (block.start, block.end))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 17_979),
+                (17_980, 22_950),
+                (22_951, 125_433),
+                (125_434, 127_919),
+                (127_920, 259_850),
+                (259_851, 260_042),
+                (260_043, 289_145),
+            ]
+        );
+        assert_eq!(
+            layout.forced_edges,
+            vec![
+                (
+                    BlockToken { id: 1, orient: '+' },
+                    BlockToken { id: 5, orient: '-' }
+                ),
+                (
+                    BlockToken { id: 5, orient: '-' },
+                    BlockToken { id: 3, orient: '+' }
+                ),
+            ]
+        );
+        let components = forced_components(&layout.blocks, &layout.forced_edges).unwrap();
+        assert!(components.contains(&vec![
+            BlockToken { id: 1, orient: '+' },
+            BlockToken { id: 5, orient: '-' },
+            BlockToken { id: 3, orient: '+' },
+        ]));
+    }
+
+    #[test]
     fn automatic_selection_requires_low_local_reference_support() {
         let rows = vec![
             HighSubgroup {
@@ -2261,6 +2460,30 @@ mod tests {
         assert_eq!(mismatch.reference_spanning_reads, [2, 2]);
         assert!(mismatch.dominance_ratio >= 3.0);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn test_segment(
+        segment_index: usize,
+        segment_count: usize,
+        query_start: usize,
+        query_end: usize,
+        subject_start: usize,
+        subject_end: usize,
+        strand: char,
+    ) -> Segment {
+        Segment {
+            read_id: "read".to_string(),
+            read_class: "FL".to_string(),
+            group_name: "type_3_subtype_rep_rep_NA".to_string(),
+            subgroup_old_index: Some(3),
+            segment_index,
+            segment_count,
+            query_start,
+            query_end,
+            subject_start,
+            subject_end,
+            strand,
+        }
     }
 
     fn test_dir(name: &str) -> PathBuf {

@@ -48,6 +48,10 @@ const REPEAT_PATH_TEMPLATE_FLANK_BP: usize = 2_000;
 const REPEAT_PATH_REQUIRED_FLANK_BP: usize = 1_000;
 const REPEAT_PATH_ALIGNMENT_TOLERANCE_BP: usize = 50;
 const REPEAT_PATH_MIN_IDENTITY: f64 = 0.95;
+// A topology-declared repeat may be shorter than 1 kb. Self-BLAST is only a
+// candidate generator; two independent node placements must still anchor it.
+const REPEAT_CORE_MIN_ALIGNMENT_BP: usize = 500;
+const REPEAT_CORE_DEFAULT_ALIGNMENT_BP: usize = 1_000;
 
 pub fn run(args: &[String]) -> Result<(), OrgraftError> {
     if args.is_empty() {
@@ -166,6 +170,13 @@ fn run_rebuild(options: &RebuildOptions) -> Result<(), OrgraftError> {
         options.keep_debug,
     )?;
     let sequence_projection_method = sequence_plan.method.clone();
+    if let Some(repeat_node) = options.repeat_resolution_node.as_deref() {
+        if sequence_projection_method == "minimap2_fallback" {
+            return Err(OrgraftError::InvalidArgument(format!(
+                "repeat-constrained rebuild for `{repeat_node}` could not anchor every topology repeat to two polished FASTA copies; refusing the non-partitioning minimap2 fallback"
+            )));
+        }
+    }
     let mapping = sequence_plan.mapping;
     let mut verified_gfa = make_verified_gfa_from_sequences(
         &merged_gfa,
@@ -905,14 +916,7 @@ fn merge_unambiguous_gfa(raw: &Gfa) -> (Gfa, String) {
     let mut seen = HashSet::new();
     for link in &raw.links {
         if let Some(converted) = convert_link(link, &old_to_new, &old_to_path_info) {
-            let key = format!(
-                "{}{}:{}{}:{}",
-                converted.from_name,
-                converted.from_orient,
-                converted.to_name,
-                converted.to_orient,
-                converted.overlap
-            );
+            let key = merged_link_key(&converted);
             if seen.insert(key) {
                 links.push(converted);
             }
@@ -934,6 +938,26 @@ fn merge_unambiguous_gfa(raw: &Gfa) -> (Gfa, String) {
         },
         mode.to_string(),
     )
+}
+
+fn merged_link_key(link: &Link) -> String {
+    let forward = format!(
+        "{}{}:{}{}:{}",
+        link.from_name, link.from_orient, link.to_name, link.to_orient, link.overlap
+    );
+    if link.from_name != link.to_name {
+        return forward;
+    }
+    let reverse = format!(
+        "{}{}:{}{}:{}",
+        link.to_name,
+        flip_orient(link.to_orient),
+        link.from_name,
+        flip_orient(link.from_orient),
+        link.overlap
+    );
+    let canonical = if forward <= reverse { forward } else { reverse };
+    format!("{canonical}:{}", link.tags.join("\t"))
 }
 
 fn repeat_like_nodes(gfa: &Gfa) -> BTreeSet<String> {
@@ -1063,7 +1087,7 @@ fn convert_link(
 ) -> Option<Link> {
     let merged_from = old_to_new.get(&link.from_name)?;
     let merged_to = old_to_new.get(&link.to_name)?;
-    if merged_from == merged_to {
+    if merged_from == merged_to && link.from_name != link.to_name {
         return None;
     }
     let from_endpoint = old_from_endpoint(link.from_orient);
@@ -1501,7 +1525,14 @@ fn infer_verified_sequences_from_repeat_cores(
         ));
     }
 
-    let core_pairs = infer_repeat_core_pairs(verified_fasta, record, blastn, repeat_count)?;
+    let repeat_core_min_alignment_bp = repeat_core_min_alignment_bp(merged, node_classes);
+    let core_pairs = infer_repeat_core_pairs(
+        verified_fasta,
+        record,
+        blastn,
+        repeat_count,
+        repeat_core_min_alignment_bp,
+    )?;
     if keep_debug {
         write_self_blast_repeat_core_debug(
             &paths.debug_dir.join("self_blast_repeat_cores.tsv"),
@@ -1728,9 +1759,10 @@ fn infer_repeat_core_pairs(
     record: &FastaRecord,
     blastn: &Path,
     repeat_count: usize,
+    min_alignment_bp: usize,
 ) -> Result<Vec<RepeatCorePair>, OrgraftError> {
     let mut rows = run_self_blastn_repeat_hits(verified_fasta, blastn)?;
-    rows.retain(|row| row.length >= 1000 && row.pident >= 95.0);
+    rows.retain(|row| row.length >= min_alignment_bp && row.pident >= 95.0);
     rows.sort_by(|a, b| {
         b.length
             .cmp(&a.length)
@@ -1770,6 +1802,25 @@ fn infer_repeat_core_pairs(
         }
     }
     Ok(selected)
+}
+
+fn repeat_core_min_alignment_bp(merged: &Gfa, node_classes: &BTreeMap<String, String>) -> usize {
+    let shortest_repeat_bp = merged
+        .order
+        .iter()
+        .filter(|name| node_classes[*name] == "repeat_node")
+        .filter_map(|name| merged.segments.get(name))
+        .map(|segment| segment.sequence.len())
+        .min()
+        .unwrap_or(REPEAT_CORE_DEFAULT_ALIGNMENT_BP);
+    repeat_core_alignment_threshold(shortest_repeat_bp)
+}
+
+fn repeat_core_alignment_threshold(shortest_repeat_bp: usize) -> usize {
+    shortest_repeat_bp.saturating_mul(3).div_ceil(4).clamp(
+        REPEAT_CORE_MIN_ALIGNMENT_BP,
+        REPEAT_CORE_DEFAULT_ALIGNMENT_BP,
+    )
 }
 
 fn run_self_blastn_repeat_hits(
@@ -2033,16 +2084,11 @@ fn assign_repeat_nodes_to_core_pairs(
             if used.contains(&index) {
                 continue;
             }
-            let score: usize = mapping.by_node[name]
-                .all_hits
-                .iter()
-                .map(|hit| {
-                    pair.copies
-                        .iter()
-                        .map(|copy| hit_interval_overlap(hit, copy))
-                        .sum::<usize>()
-                })
-                .sum();
+            let Some(score) =
+                repeat_pair_mapping_score(&mapping.by_node[name], pair, mapping.reference_len)
+            else {
+                continue;
+            };
             if best_index.is_none() || score > best_score {
                 best_index = Some(index);
                 best_score = score;
@@ -2054,6 +2100,43 @@ fn assign_repeat_nodes_to_core_pairs(
         }
     }
     assignments
+}
+
+fn repeat_pair_mapping_score(
+    mapping: &NodeMapping,
+    pair: &RepeatCorePair,
+    reference_len: usize,
+) -> Option<usize> {
+    if pair.copies.len() != 2 || mapping.accepted_hits.len() < 2 {
+        return None;
+    }
+    let required_overlap = pair.length.saturating_mul(3).div_ceil(4);
+    let mut best = None;
+    for first_index in 0..mapping.accepted_hits.len() {
+        for second_index in 0..mapping.accepted_hits.len() {
+            if first_index == second_index {
+                continue;
+            }
+            let first_overlap = circular_hit_interval_overlap(
+                &mapping.accepted_hits[first_index],
+                &pair.copies[0],
+                reference_len,
+            );
+            let second_overlap = circular_hit_interval_overlap(
+                &mapping.accepted_hits[second_index],
+                &pair.copies[1],
+                reference_len,
+            );
+            if first_overlap < required_overlap || second_overlap < required_overlap {
+                continue;
+            }
+            let score = first_overlap + second_overlap;
+            if best.is_none_or(|current| score > current) {
+                best = Some(score);
+            }
+        }
+    }
+    best
 }
 
 fn build_repeat_core_gaps(
@@ -2179,6 +2262,13 @@ fn best_orientation_for_parts(name: &str, parts: &[(usize, usize)], mapping: &Ma
 
 fn hit_interval_overlap(hit: &PafHit, copy: &RepeatCopy) -> usize {
     interval_overlap(hit.target_start + 1, hit.target_end, copy.start, copy.end)
+}
+
+fn circular_hit_interval_overlap(hit: &PafHit, copy: &RepeatCopy, reference_len: usize) -> usize {
+    folded_interval_parts(&hit.folded(reference_len), reference_len)
+        .into_iter()
+        .map(|(start, end)| interval_overlap(start, end, copy.start, copy.end))
+        .sum()
 }
 
 fn hit_overlap_with_parts(hit: &PafHit, parts: &[(usize, usize)]) -> usize {
@@ -4797,6 +4887,78 @@ mod tests {
     }
 
     #[test]
+    fn repeat_core_alignment_threshold_adapts_below_one_kilobase() {
+        assert_eq!(repeat_core_alignment_threshold(873), 655);
+        assert_eq!(repeat_core_alignment_threshold(2_000), 1_000);
+        assert_eq!(repeat_core_alignment_threshold(400), 500);
+    }
+
+    #[test]
+    fn repeat_core_assignment_requires_two_mapping_anchored_copies() {
+        let pair = RepeatCorePair {
+            length: 878,
+            source_blast_length: 878,
+            source_pident: 99.886,
+            source_gapopen: 1,
+            source_mismatch: 0,
+            boundary_extension_left: 0,
+            boundary_extension_right: 0,
+            copies: vec![
+                RepeatCopy {
+                    start: 1_000,
+                    end: 1_877,
+                    strand: '+',
+                },
+                RepeatCopy {
+                    start: 5_000,
+                    end: 5_877,
+                    strand: '-',
+                },
+            ],
+        };
+        let both_copies = test_mapping(vec![
+            make_synthetic_hit("repeat", 878, 1, 878, 1_000, 1_877, '+'),
+            make_synthetic_hit("repeat", 878, 1, 878, 5_000, 5_877, '-'),
+        ]);
+        let doubled_reference_copies = test_mapping(vec![
+            make_synthetic_hit("repeat", 878, 1, 878, 21_000, 21_877, '+'),
+            make_synthetic_hit("repeat", 878, 1, 878, 25_000, 25_877, '-'),
+        ]);
+        let one_copy = test_mapping(vec![make_synthetic_hit(
+            "repeat", 878, 1, 878, 1_000, 1_877, '+',
+        )]);
+        let decoy = RepeatCorePair {
+            copies: vec![
+                RepeatCopy {
+                    start: 10_000,
+                    end: 10_877,
+                    strand: '+',
+                },
+                RepeatCopy {
+                    start: 15_000,
+                    end: 15_877,
+                    strand: '-',
+                },
+            ],
+            ..pair.clone()
+        };
+
+        assert_eq!(
+            repeat_pair_mapping_score(&both_copies, &pair, 20_000),
+            Some(1_756)
+        );
+        assert_eq!(
+            repeat_pair_mapping_score(&doubled_reference_copies, &pair, 20_000),
+            Some(1_756)
+        );
+        assert_eq!(repeat_pair_mapping_score(&one_copy, &pair, 20_000), None);
+        assert_eq!(
+            repeat_pair_mapping_score(&both_copies, &decoy, 20_000),
+            None
+        );
+    }
+
+    #[test]
     fn circular_projection_dedupes_wrap_and_truncated_same_placement() {
         let make_hit = |query_start, query_end, target_start, target_end| PafHit {
             query_name: "long_node".to_string(),
@@ -4888,6 +5050,122 @@ mod tests {
         assert_eq!(consistency.gap_bases, 2);
         assert_eq!(consistency.multi_covered_bases, 1);
         assert_eq!(consistency.linear_tiling_status(), "WARN");
+    }
+
+    #[test]
+    fn premerge_preserves_one_bidirected_self_link() {
+        let mut raw = test_gfa(&[("u0", "ACGT")]);
+        raw.links = vec![
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '+',
+                to_name: "u0".to_string(),
+                to_orient: '+',
+                overlap: "3M".to_string(),
+                tags: vec!["EC:i:499".to_string()],
+            },
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '-',
+                to_name: "u0".to_string(),
+                to_orient: '-',
+                overlap: "3M".to_string(),
+                tags: vec!["EC:i:499".to_string()],
+            },
+        ];
+
+        let (merged, mode) = merge_unambiguous_gfa(&raw);
+
+        assert_eq!(mode, "input_already_merged_or_no_linear_compaction");
+        assert_eq!(merged.order, vec!["u0"]);
+        assert_eq!(merged.links.len(), 1);
+        assert_eq!(merged.links[0].from_name, "u0");
+        assert_eq!(merged.links[0].to_name, "u0");
+        assert_eq!(merged.links[0].overlap, "3M");
+        assert_eq!(merged.links[0].tags, vec!["EC:i:499"]);
+        assert_eq!(merged.degrees()["u0"], 2);
+        assert!(repeat_like_nodes(&merged).is_empty());
+    }
+
+    #[test]
+    fn premerge_still_drops_links_absorbed_by_linear_compaction() {
+        let mut raw = test_gfa(&[("a", "AC"), ("b", "GT")]);
+        raw.links.push(Link {
+            from_name: "a".to_string(),
+            from_orient: '+',
+            to_name: "b".to_string(),
+            to_orient: '+',
+            overlap: "0M".to_string(),
+            tags: Vec::new(),
+        });
+
+        let (merged, mode) = merge_unambiguous_gfa(&raw);
+
+        assert_eq!(mode, "auto_non_repeat_linear_compaction");
+        assert_eq!(merged.order, vec!["a_b"]);
+        assert!(merged.links.is_empty());
+    }
+
+    #[test]
+    fn premerge_keeps_distinct_self_link_topologies() {
+        let mut raw = test_gfa(&[("u0", "ACGT")]);
+        raw.links = vec![
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '+',
+                to_name: "u0".to_string(),
+                to_orient: '-',
+                overlap: "0M".to_string(),
+                tags: Vec::new(),
+            },
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '-',
+                to_name: "u0".to_string(),
+                to_orient: '+',
+                overlap: "0M".to_string(),
+                tags: Vec::new(),
+            },
+        ];
+
+        let (merged, _) = merge_unambiguous_gfa(&raw);
+
+        assert_eq!(merged.links.len(), 2);
+    }
+
+    #[test]
+    fn premerge_keeps_conflicting_reciprocal_self_link_evidence() {
+        let mut raw = test_gfa(&[("u0", "ACGT")]);
+        raw.links = vec![
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '+',
+                to_name: "u0".to_string(),
+                to_orient: '+',
+                overlap: "3M".to_string(),
+                tags: vec!["EC:i:499".to_string()],
+            },
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '-',
+                to_name: "u0".to_string(),
+                to_orient: '-',
+                overlap: "3M".to_string(),
+                tags: vec!["EC:i:500".to_string()],
+            },
+            Link {
+                from_name: "u0".to_string(),
+                from_orient: '-',
+                to_name: "u0".to_string(),
+                to_orient: '-',
+                overlap: "2M".to_string(),
+                tags: vec!["EC:i:499".to_string()],
+            },
+        ];
+
+        let (merged, _) = merge_unambiguous_gfa(&raw);
+
+        assert_eq!(merged.links.len(), 3);
     }
 
     #[test]
