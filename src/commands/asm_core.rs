@@ -184,6 +184,7 @@ pub(super) struct DraftAssemblyRequest {
     pub(super) data_mode: DraftDataMode,
     pub(super) auto_read_subset: bool,
     pub(super) repeat_aware_resolution: bool,
+    pub(super) skeleton_gfa: Option<PathBuf>,
     pub(super) reads: Vec<PathBuf>,
     pub(super) out_dir: PathBuf,
     pub(super) threads: usize,
@@ -396,8 +397,7 @@ fn run_algorithm_steps(mut config: Config, started: Instant) -> io::Result<()> {
 
 fn run_configured_workflow(config: &Config, started: Instant) -> io::Result<()> {
     if config.mito_stable && config.skeleton_gfa.is_some() {
-        run_mito_stable_linking(config, None)?;
-        return Ok(());
+        return run_skeleton_gfa_repair_workflow(config, started);
     }
     if config.skeleton_only {
         if config.mito_stable {
@@ -1248,6 +1248,84 @@ fn run_two_round_skeleton_workflow(config: &Config, started: Instant) -> io::Res
     Ok(())
 }
 
+fn run_skeleton_gfa_repair_workflow(config: &Config, started: Instant) -> io::Result<()> {
+    let source_gfa = config.skeleton_gfa.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skeleton-GFA repair requires --skeleton-gfa",
+        )
+    })?;
+    fs::create_dir_all(&config.out_dir)?;
+
+    let support_dir = anchor_support_dir(&config.out_dir);
+    let seed_graph_dir = unitig_graph_dir(&config.out_dir);
+    let read_junction_dir = read_junction_graph_dir(&config.out_dir);
+    let bridge_rescue_dir = low_depth_bridge_rescue_dir(&config.out_dir);
+    let link_evidence_dir = skeleton_link_evidence_dir(&config.out_dir);
+    let repeat_resolution_dir = repeat_aware_resolution_dir(&config.out_dir);
+    let linked_graph_dir = linked_graph_dir(&config.out_dir);
+    let summary_dir = workflow_summary_dir(&config.out_dir);
+
+    write_step_status_report(
+        &support_dir,
+        "01.anchor_walk_support",
+        "skipped",
+        "skeleton-GFA repair starts from the supplied graph instead of de novo anchor walks",
+        Some(source_gfa),
+        None,
+    )?;
+    fs::create_dir_all(&seed_graph_dir)?;
+    let staged_gfa = seed_graph_dir.join("graph.gfa");
+    fs::copy(source_gfa, &staged_gfa)?;
+    write_step_status_report(
+        &seed_graph_dir,
+        "02.unitig_graph",
+        "provided",
+        "copied the supplied skeleton GFA without de novo graph construction",
+        Some(source_gfa),
+        Some(&seed_graph_dir),
+    )?;
+    write_step_status_report(
+        &read_junction_dir,
+        "03.read_junction_graph",
+        "skipped",
+        "no de novo read-junction companion graph is built in skeleton-GFA repair mode",
+        Some(&seed_graph_dir),
+        None,
+    )?;
+    write_step_status_report(
+        &bridge_rescue_dir,
+        "04.low_depth_bridge_rescue",
+        "skipped",
+        "skeleton-GFA repair proceeds directly to read remapping and repeat-aware resolution",
+        Some(&seed_graph_dir),
+        None,
+    )?;
+
+    let mut repair = config.clone();
+    repair.out_dir = link_evidence_dir.clone();
+    repair.rounds = 1;
+    repair.skeleton_only = true;
+    repair.skeleton_gfa = Some(staged_gfa);
+    repair.skeleton_rescue_gfa = None;
+    run_mito_stable_linking(&repair, Some(&repeat_resolution_dir))?;
+    copy_final_two_round_outputs(&repeat_resolution_dir, &linked_graph_dir)?;
+    write_skeleton_gfa_repair_report(
+        config,
+        source_gfa,
+        &support_dir,
+        &seed_graph_dir,
+        &read_junction_dir,
+        &bridge_rescue_dir,
+        &link_evidence_dir,
+        &repeat_resolution_dir,
+        &linked_graph_dir,
+        &summary_dir,
+        started,
+    )?;
+    Ok(())
+}
+
 fn copy_final_two_round_outputs(evidence_dir: &Path, linked_graph_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(linked_graph_dir)?;
     copy_if_exists(
@@ -2023,6 +2101,91 @@ fn write_two_round_report(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_skeleton_gfa_repair_report(
+    config: &Config,
+    source_gfa: &Path,
+    support_dir: &Path,
+    seed_graph_dir: &Path,
+    read_junction_dir: &Path,
+    bridge_rescue_dir: &Path,
+    link_evidence_dir: &Path,
+    repeat_resolution_dir: &Path,
+    linked_graph_dir: &Path,
+    summary_dir: &Path,
+    started: Instant,
+) -> io::Result<()> {
+    fs::create_dir_all(summary_dir)?;
+    let mut out = File::create(summary_dir.join("report.txt"))?;
+    writeln!(out, "orgraft_asm skeleton-GFA repair report")?;
+    write_workflow_header(&mut out, config, started)?;
+    writeln!(out, "graph_workflow\tdirect_gfa_repeat_aware")?;
+    writeln!(out, "input_mode\tskeleton_gfa_repair")?;
+    writeln!(out, "input_skeleton_gfa\t{}", source_gfa.display())?;
+    writeln!(out, "reads_role\tremapping_evidence_only")?;
+    writeln!(
+        out,
+        "caution\tdepth and link support are recalculated from the supplied reads and require cautious interpretation when the reads and GFA do not share the same recruitment, splitting, correction, or subset history"
+    )?;
+    writeln!(
+        out,
+        "gfa_reconstruction\toutput is reconstructed from GFA1 S/L topology plus read evidence; other record types and arbitrary custom tags are not preserved"
+    )?;
+    writeln!(
+        out,
+        "input_link_policy\tinput L records without RC:i support must meet read-remapping support thresholds to remain"
+    )?;
+    writeln!(
+        out,
+        "workflow_steps\t01.anchor_walk_support(skipped),02.unitig_graph(provided),03.read_junction_graph(skipped),04.low_depth_bridge_rescue(skipped),05.skeleton_link_evidence(resolved),06.repeat_aware_resolution(resolved),07.linked_graph(resolved),08.workflow_summary(resolved)"
+    )?;
+    writeln!(
+        out,
+        "anchor_walk_support\t{} (skipped)",
+        support_dir.display()
+    )?;
+    writeln!(out, "unitig_graph\t{} (provided)", seed_graph_dir.display())?;
+    writeln!(
+        out,
+        "read_junction_graph\t{} (skipped)",
+        read_junction_dir.display()
+    )?;
+    writeln!(
+        out,
+        "low_depth_bridge_rescue\t{} (skipped)",
+        bridge_rescue_dir.display()
+    )?;
+    writeln!(
+        out,
+        "skeleton_link_evidence\t{}",
+        link_evidence_dir.display()
+    )?;
+    writeln!(
+        out,
+        "repeat_aware_resolution\t{} (resolved)",
+        repeat_resolution_dir.display()
+    )?;
+    writeln!(out, "linked_graph\t{}", linked_graph_dir.display())?;
+    writeln!(
+        out,
+        "output_graph\t{}",
+        linked_graph_dir.join("graph.gfa").display()
+    )?;
+    writeln!(
+        out,
+        "output_depth\t{}",
+        linked_graph_dir.join("depth.tsv").display()
+    )?;
+    writeln!(
+        out,
+        "output_links\t{}",
+        linked_graph_dir.join("links.tsv").display()
+    )?;
+    write_workflow_parameters(&mut out, config)?;
+    write_profile_parameter_report(&summary_dir.join("profile_parameters.tsv"), config)?;
+    Ok(())
+}
+
 fn write_workflow_header<W: Write>(
     out: &mut W,
     config: &Config,
@@ -2086,7 +2249,9 @@ fn write_workflow_parameters<W: Write>(out: &mut W, config: &Config) -> io::Resu
 }
 
 fn graph_workflow_label(config: &Config) -> &'static str {
-    if config.rounds >= 2 {
+    if config.mito_stable && config.skeleton_gfa.is_some() {
+        "direct_gfa_repeat_aware"
+    } else if config.rounds >= 2 {
         if config.mito_stable {
             "repeat_aware_skeleton_link"
         } else {
@@ -2495,6 +2660,18 @@ impl Config {
         if request.threads == 0 {
             return Err("threads must be greater than 0".to_string());
         }
+        if request.skeleton_gfa.is_some() && !request.repeat_aware_resolution {
+            return Err("skeleton-GFA repair requires repeat-aware resolution".to_string());
+        }
+        if request.skeleton_gfa.is_some()
+            && (request.data_mode != DraftDataMode::Standard
+                || request.auto_read_subset
+                || request.read_subsets.is_some())
+        {
+            return Err(
+                "skeleton-GFA repair requires standard data mode without read subsets".to_string(),
+            );
+        }
 
         let organelle = request.organelle;
         let mut config = Config::base();
@@ -2502,6 +2679,8 @@ impl Config {
         config.out_dir = request.out_dir;
         config.threads = request.threads;
         config.keep_debug_files = request.keep_debug_files;
+        config.skeleton_gfa = request.skeleton_gfa;
+        config.skeleton_only = config.skeleton_gfa.is_some();
         config.organelle = Some(match organelle {
             DraftOrganelle::Mito => OrganelleProfile::Mito,
             DraftOrganelle::Plastid => OrganelleProfile::Plastid,
@@ -7573,34 +7752,105 @@ fn read_skeleton_gfa(
 )> {
     let reader = BufReader::new(File::open(path)?);
     let mut segments = Vec::new();
+    let mut segment_names = HashSet::new();
     let mut links: HashMap<SkeletonLinkKey, SkeletonLinkSupport> = HashMap::new();
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
+        let line_number = line_index + 1;
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.is_empty() {
             continue;
         }
         match fields[0] {
-            "S" if fields.len() >= 3 => segments.push(SkeletonSegment {
-                name: fields[1].to_string(),
-                sequence: fields[2].to_string(),
-            }),
-            "L" if fields.len() >= 5 => {
+            "S" => {
+                if fields.len() < 3 || fields[1].is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}:{line_number}: malformed S record", path.display()),
+                    ));
+                }
+                if fields[2].is_empty() || fields[2] == "*" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}:{line_number}: skeleton-GFA repair requires inline segment sequences",
+                            path.display()
+                        ),
+                    ));
+                }
+                if !segment_names.insert(fields[1].to_string()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}:{line_number}: duplicate segment ID `{}`",
+                            path.display(),
+                            fields[1]
+                        ),
+                    ));
+                }
+                segments.push(SkeletonSegment {
+                    name: fields[1].to_string(),
+                    sequence: fields[2].to_string(),
+                });
+            }
+            "L" => {
+                if fields.len() < 6 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}:{line_number}: malformed L record", path.display()),
+                    ));
+                }
+                if !matches!(fields[2], "+" | "-") || !matches!(fields[4], "+" | "-") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}:{line_number}: L orientations must be + or -",
+                            path.display()
+                        ),
+                    ));
+                }
                 let mut support = 0u32;
                 for field in &fields[5..] {
                     if let Some(value) = field.strip_prefix("RC:i:") {
-                        support = value.parse().unwrap_or(0);
+                        support = value.parse().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "{}:{line_number}: invalid RC:i link support",
+                                    path.display()
+                                ),
+                            )
+                        })?;
                     }
                 }
                 let key = SkeletonLinkKey {
                     from: fields[1].to_string(),
-                    from_orient: fields[2].chars().next().unwrap_or('+'),
+                    from_orient: fields[2].chars().next().expect("validated orientation"),
                     to: fields[3].to_string(),
-                    to_orient: fields[4].chars().next().unwrap_or('+'),
+                    to_orient: fields[4].chars().next().expect("validated orientation"),
                 };
                 links.entry(key).or_default().skeleton_support = support;
             }
             _ => {}
+        }
+    }
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has no S records", path.display()),
+        ));
+    }
+    for key in links.keys() {
+        for endpoint in [&key.from, &key.to] {
+            if !segment_names.contains(endpoint) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: L record references undeclared segment `{endpoint}`",
+                        path.display()
+                    ),
+                ));
+            }
         }
     }
     Ok((segments, links))
@@ -9832,6 +10082,7 @@ mod tests {
             data_mode: DraftDataMode::Standard,
             auto_read_subset: false,
             repeat_aware_resolution: true,
+            skeleton_gfa: None,
             reads: vec![PathBuf::from("reads.fastq.gz")],
             out_dir: PathBuf::from("draft_asm/mito/02.anchor_graph_core"),
             threads: 4,
@@ -9865,6 +10116,7 @@ mod tests {
             data_mode: DraftDataMode::Standard,
             auto_read_subset: false,
             repeat_aware_resolution: true,
+            skeleton_gfa: None,
             reads: vec![PathBuf::from("reads.fastq.gz")],
             out_dir: PathBuf::from("draft_asm/plastid/02.anchor_graph_core"),
             threads: 2,
@@ -9891,12 +10143,98 @@ mod tests {
     }
 
     #[test]
+    fn draft_request_skeleton_gfa_selects_direct_repair_workflow() {
+        let config = Config::from_draft_request(DraftAssemblyRequest {
+            organelle: DraftOrganelle::Plastid,
+            data_mode: DraftDataMode::Standard,
+            auto_read_subset: false,
+            repeat_aware_resolution: true,
+            skeleton_gfa: Some(PathBuf::from("checked.gfa")),
+            reads: vec![PathBuf::from("reads.fastq.gz")],
+            out_dir: PathBuf::from("draft_asm/plastid/02.anchor_graph_core"),
+            threads: 2,
+            min_graph_coverage: None,
+            min_branch_ratio: None,
+            min_tip_len: None,
+            min_link_support: None,
+            min_link_ratio: None,
+            read_subsets: None,
+            keep_debug_files: false,
+        })
+        .unwrap();
+
+        assert_eq!(config.skeleton_gfa, Some(PathBuf::from("checked.gfa")));
+        assert!(config.skeleton_only);
+        assert!(config.mito_stable);
+        assert_eq!(graph_workflow_label(&config), "direct_gfa_repeat_aware");
+    }
+
+    #[test]
+    fn draft_request_skeleton_gfa_requires_repeat_aware_resolution() {
+        let error = Config::from_draft_request(DraftAssemblyRequest {
+            organelle: DraftOrganelle::Mito,
+            data_mode: DraftDataMode::Standard,
+            auto_read_subset: false,
+            repeat_aware_resolution: false,
+            skeleton_gfa: Some(PathBuf::from("checked.gfa")),
+            reads: vec![PathBuf::from("reads.fastq.gz")],
+            out_dir: PathBuf::from("draft_asm/mito/02.anchor_graph_core"),
+            threads: 2,
+            min_graph_coverage: None,
+            min_branch_ratio: None,
+            min_tip_len: None,
+            min_link_support: None,
+            min_link_ratio: None,
+            read_subsets: None,
+            keep_debug_files: false,
+        })
+        .unwrap_err();
+
+        assert!(error.contains("requires repeat-aware resolution"));
+    }
+
+    #[test]
+    fn skeleton_gfa_preflight_rejects_unsafe_graph_records() {
+        let cases = [
+            ("H\tVN:Z:1.0\n", "has no S records"),
+            ("S\tu1\t*\n", "requires inline segment sequences"),
+            ("S\tu1\tAAAA\nS\tu1\tCCCC\n", "duplicate segment ID"),
+            (
+                "S\tu1\tAAAA\nL\tu1\t+\tu2\t+\t0M\n",
+                "references undeclared segment",
+            ),
+            (
+                "S\tu1\tAAAA\nS\tu2\tCCCC\nL\tu1\t?\tu2\t+\t0M\n",
+                "orientations must be + or -",
+            ),
+            ("S\tu1\tAAAA\nL\tu1\t+\tu1\t+\n", "malformed L record"),
+        ];
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        for (index, (text, expected)) in cases.iter().enumerate() {
+            let path =
+                std::env::temp_dir().join(format!("orgraft-invalid-skeleton-{nonce}-{index}.gfa"));
+            fs::write(&path, text).unwrap();
+            let error = read_skeleton_gfa(&path).unwrap_err();
+            fs::remove_file(&path).unwrap();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+    }
+
+    #[test]
     fn draft_request_plastid_standard_uses_one_round_defaults() {
         let config = Config::from_draft_request(DraftAssemblyRequest {
             organelle: DraftOrganelle::Plastid,
             data_mode: DraftDataMode::Standard,
             auto_read_subset: false,
             repeat_aware_resolution: false,
+            skeleton_gfa: None,
             reads: vec![PathBuf::from("reads.fastq.gz")],
             out_dir: PathBuf::from("draft_asm/plastid/02.anchor_graph_core"),
             threads: 2,
@@ -9931,6 +10269,7 @@ mod tests {
             data_mode: DraftDataMode::Standard,
             auto_read_subset: true,
             repeat_aware_resolution: false,
+            skeleton_gfa: None,
             reads: vec![PathBuf::from("reads.fastq.gz")],
             out_dir: PathBuf::from("draft_asm/plastid/02.anchor_graph_core"),
             threads: 2,

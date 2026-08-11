@@ -16,14 +16,16 @@ use crate::error::OrgraftError;
 // top-level output layout, call the assembly core, and publish the final graph.
 const HELP: &str = r#"orgraft asm
 
-Conservative draft graph assembly from recruited organelle reads.
+Conservative draft graph assembly or read-backed repair of a supplied GFA.
 
 Usage:
   orgraft asm --reads FILE --organelle mito|plastid [options]
+  orgraft asm --reads FILE --organelle mito|plastid --skeleton-gfa FILE --stable [options]
 
 Inputs:
-  --reads FILE                  recruited organelle reads
+  --reads FILE                  recruited reads, or remapping evidence in GFA repair mode
   --organelle NAME              mito or plastid
+  --skeleton-gfa FILE           manually reviewed GFA to repair; requires --stable
   --soft-paths FILE             software path table for minimap2 [soft_paths.txt]
 
 Outputs:
@@ -37,6 +39,15 @@ Additional Parameters:
   --image-reference-fasta FILE  reference FASTA; exports graph.pdf/svg
 
 Layout: OUT/ORGANELLE/{01.input_reads,02.anchor_graph_core,03.finalize_graph,logs}
+
+GFA repair note:
+  --skeleton-gfa skips de novo anchor graph construction. Reads are still required
+  as remapping evidence. Treat recalculated depth and link support cautiously,
+  especially when the reads and supplied GFA were produced from different subsets.
+  Use the standard profile and a new output root. Input must be GFA1 with unique
+  S IDs, inline segment sequences, valid +/- L orientations, and declared endpoints.
+  The repaired graph is reconstructed from S/L plus read evidence; other record
+  types and custom tags are not preserved.
 
 Finalize note:
   02.anchor_graph_core keeps algorithm/debug graphs unchanged. 03.finalize_graph
@@ -80,12 +91,17 @@ Each run writes exact active values to 08.workflow_summary/profile_parameters.ts
 
 Advanced parameters:
   --stable                  opt-in repeat-aware topology resolution for mito or plastid
+  --skeleton-gfa FILE       repair this GFA directly with --stable; skips de novo assembly
   --min-graph-coverage N    override shared anchor/edge coverage floor
   --min-link-ratio FLOAT    optional weak-link ratio filter
   --subsets LIST            manual read subset percent(s) for high-depth reruns
   --finalize-dedup-rc-links on|off  deduplicate RC L records in finalize graph [on]
   --image-reference-fasta FILE       export graph.pdf/svg from finalize graph
   --keep-debug-files        keep .full.* graph companions and subset FASTA files
+
+Skeleton-GFA repair accepts only the standard profile and rejects --subsets,
+--min-graph-coverage, and --branch-ratio. Input L records without RC:i support
+must earn sufficient support from read remapping to remain in the repaired graph.
 "#;
 
 const DEFAULT_THREADS: usize = 8;
@@ -134,6 +150,28 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
     let logs_dir = organelle_dir.join("logs");
     let output_gfa = finalize_step.join("graph.gfa");
 
+    let source_reads = canonicalize_existing(&input.reads)?;
+    let source_skeleton_gfa = input
+        .skeleton_gfa
+        .as_ref()
+        .map(|path| canonicalize_existing(path))
+        .transpose()?;
+
+    if options.force {
+        if let Some(source_gfa) = &source_skeleton_gfa {
+            for target in [&input_step, &work_dir, &finalize_step, &logs_dir] {
+                if fs::canonicalize(target)
+                    .is_ok_and(|canonical_target| source_gfa.starts_with(canonical_target))
+                {
+                    return Err(OrgraftError::InvalidArgument(format!(
+                        "--skeleton-gfa {} is inside outputs that --force would remove; use a separate --out-dir",
+                        source_gfa.display()
+                    )));
+                }
+            }
+        }
+    }
+
     if !options.force && (work_dir.exists() || output_gfa.exists()) {
         return Err(OrgraftError::InvalidArgument(format!(
             "{} already exists; use --force to replace outputs for {label}",
@@ -153,7 +191,6 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
     fs::create_dir_all(&logs_dir)?;
     write_algorithm_notes(&logs_dir.join("algorithm.md"))?;
 
-    let source_reads = canonicalize_existing(&input.reads)?;
     let image_reference_fasta = options
         .image_reference_fasta
         .as_ref()
@@ -165,13 +202,22 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
         input,
         &source_reads,
         &reads_for_command,
+        source_skeleton_gfa.as_deref(),
     )?;
+
+    if let Some(source_gfa) = &source_skeleton_gfa {
+        eprintln!(
+            "Warning: --skeleton-gfa repair mode skips de novo assembly and uses {} as the graph start. Reads are remapping evidence only; interpret recalculated depth and link support cautiously. The output is reconstructed from GFA S/L records and does not preserve other record types or custom tags.",
+            source_gfa.display()
+        );
+    }
 
     let core_request = asm_core::DraftAssemblyRequest {
         organelle: input.organelle.to_core(),
         data_mode: profile.to_core_data_mode(),
         auto_read_subset: profile.auto_read_subset() && options.read_subsets.is_none(),
         repeat_aware_resolution: input.repeat_aware_resolution,
+        skeleton_gfa: source_skeleton_gfa.clone(),
         reads: vec![reads_for_command.clone()],
         out_dir: work_dir.clone(),
         threads: options.threads,
@@ -247,6 +293,7 @@ fn run_one_input(options: &AsmOptions, input: &AsmInput) -> Result<RunSummary, O
         organelle: input.organelle,
         profile,
         repeat_aware_resolution: input.repeat_aware_resolution,
+        skeleton_gfa: source_skeleton_gfa,
         reads: source_reads,
         work_dir,
         selected_graph,
@@ -261,10 +308,11 @@ fn contract() -> CommandContract {
     CommandContract {
         command: "asm",
         origin: "refactored internal anchor graph construction logic",
-        purpose: "build conservative plant organelle draft graphs from recruited reads",
+        purpose: "build conservative plant organelle draft graphs or repair a supplied GFA with read-backed evidence",
         inputs: &[
             "--reads FILE",
             "--organelle mito|plastid",
+            "optional --skeleton-gfa FILE with --stable for direct GFA repair",
             "minimap2 executable for skeleton-link workflows",
         ],
         outputs: &[
@@ -279,6 +327,8 @@ fn contract() -> CommandContract {
             "OrgRAFT runs one explicit profile for one recruited read input",
             "mito defaults to the standard skeleton-link workflow",
             "plastid defaults to the standard direct-anchor workflow",
+            "--skeleton-gfa skips de novo assembly but still requires reads for remapping evidence",
+            "depth and link support from GFA repair mode require cautious interpretation",
             "graph PDF/SVG export runs only when --image-reference-fasta is provided",
             "polishing is intentionally not part of this draft assembly command",
         ],
@@ -319,6 +369,7 @@ impl AsmOptions {
         let mut image_reference_fasta = None;
         let mut keep_debug_files = false;
         let mut stable = false;
+        let mut skeleton_gfa = None;
         let mut profile = AsmProfile::Standard;
         let mut reads: Option<PathBuf> = None;
         let mut organelle: Option<Organelle> = None;
@@ -435,6 +486,18 @@ impl AsmOptions {
                         "--image-reference-fasta",
                     )?));
                 }
+                "--skeleton-gfa" => {
+                    if skeleton_gfa.is_some() {
+                        return Err(OrgraftError::InvalidArgument(
+                            "--skeleton-gfa may be provided only once".to_string(),
+                        ));
+                    }
+                    skeleton_gfa = Some(PathBuf::from(value_after(
+                        args,
+                        &mut index,
+                        "--skeleton-gfa",
+                    )?));
+                }
                 "--stable" => stable = true,
                 "--keep-debug-files" => keep_debug_files = true,
                 "--force" => force = true,
@@ -452,6 +515,23 @@ impl AsmOptions {
         let organelle = organelle.ok_or_else(|| {
             OrgraftError::InvalidArgument("missing --organelle mito|plastid".to_string())
         })?;
+        if skeleton_gfa.is_some() && !stable {
+            return Err(OrgraftError::InvalidArgument(
+                "--skeleton-gfa requires --stable because it is only supported for repeat-aware GFA repair"
+                    .to_string(),
+            ));
+        }
+        if skeleton_gfa.is_some()
+            && (profile != AsmProfile::Standard
+                || read_subsets.is_some()
+                || min_graph_coverage.is_some()
+                || min_branch_ratio.is_some())
+        {
+            return Err(OrgraftError::InvalidArgument(
+                "--skeleton-gfa repair mode requires --profile standard and cannot use --subsets, --min-graph-coverage, or --branch-ratio"
+                    .to_string(),
+            ));
+        }
         let soft_paths = read_soft_paths_optional(&soft_paths_file)?;
 
         Ok(Self {
@@ -460,6 +540,7 @@ impl AsmOptions {
                 reads,
                 profile,
                 repeat_aware_resolution: stable,
+                skeleton_gfa,
             },
             out_dir,
             soft_paths,
@@ -488,6 +569,7 @@ struct AsmInput {
     reads: PathBuf,
     profile: AsmProfile,
     repeat_aware_resolution: bool,
+    skeleton_gfa: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +577,7 @@ struct RunSummary {
     organelle: Organelle,
     profile: AsmProfile,
     repeat_aware_resolution: bool,
+    skeleton_gfa: Option<PathBuf>,
     reads: PathBuf,
     work_dir: PathBuf,
     selected_graph: PathBuf,
@@ -700,6 +783,7 @@ fn write_input_manifest(
     input: &AsmInput,
     source_reads: &Path,
     command_reads: &Path,
+    source_skeleton_gfa: Option<&Path>,
 ) -> Result<(), OrgraftError> {
     let mut out = File::create(path)?;
     writeln!(out, "key\tvalue")?;
@@ -712,6 +796,22 @@ fn write_input_manifest(
     )?;
     writeln!(out, "source_reads\t{}", source_reads.display())?;
     writeln!(out, "command_reads\t{}", command_reads.display())?;
+    writeln!(
+        out,
+        "input_mode\t{}",
+        if source_skeleton_gfa.is_some() {
+            "skeleton_gfa_repair"
+        } else {
+            "de_novo_reads"
+        }
+    )?;
+    if let Some(source_skeleton_gfa) = source_skeleton_gfa {
+        writeln!(
+            out,
+            "source_skeleton_gfa\t{}",
+            source_skeleton_gfa.display()
+        )?;
+    }
     Ok(())
 }
 
@@ -746,6 +846,12 @@ fn write_core_request_manifest(
         "repeat_aware_resolution\t{}",
         request.repeat_aware_resolution
     )?;
+    if let Some(skeleton_gfa) = &request.skeleton_gfa {
+        writeln!(out, "input_mode\tskeleton_gfa_repair")?;
+        writeln!(out, "skeleton_gfa\t{}", skeleton_gfa.display())?;
+    } else {
+        writeln!(out, "input_mode\tde_novo_reads")?;
+    }
     if let Some(read_subsets) = &request.read_subsets {
         writeln!(out, "subsets\t{}", format_subset_list(read_subsets))?;
     }
@@ -987,6 +1093,11 @@ fn write_core_output_manifest(path: &Path, work_dir: &Path) -> Result<(), Orgraf
             "deterministic read-subset selection summary for high profiles",
         ),
         (
+            "01.anchor_walk_support/report.txt",
+            "01.anchor_walk_support",
+            "anchor-walk status report for supplied-GFA repair",
+        ),
+        (
             "01.anchor_walk_support/anchors.tsv",
             "01.anchor_walk_support",
             "anchor nodes retained before graph compression",
@@ -1005,6 +1116,11 @@ fn write_core_output_manifest(path: &Path, work_dir: &Path) -> Result<(), Orgraf
             "02.unitig_graph/graph.gfa",
             "02.unitig_graph",
             "direct-anchor graph or conservative skeleton seed graph",
+        ),
+        (
+            "02.unitig_graph/report.txt",
+            "02.unitig_graph",
+            "unitig construction or supplied-GFA staging report",
         ),
         (
             "02.unitig_graph/graph.full.gfa",
@@ -1129,7 +1245,7 @@ fn write_core_output_manifest(path: &Path, work_dir: &Path) -> Result<(), Orgraf
         (
             "08.workflow_summary/report.txt",
             "08.workflow_summary",
-            "anchor graph workflow report",
+            "assembly or supplied-GFA repair workflow report",
         ),
         (
             "08.workflow_summary/profile_parameters.tsv",
@@ -1193,12 +1309,12 @@ fn write_run_manifest(path: &Path, summaries: &[RunSummary]) -> Result<(), Orgra
     let mut out = File::create(path)?;
     writeln!(
         out,
-        "organelle\tprofile\trepeat_aware_resolution\treads\twork_dir\tselected_graph\toutput_gfa\telapsed_seconds"
+        "organelle\tprofile\trepeat_aware_resolution\treads\twork_dir\tselected_graph\toutput_gfa\telapsed_seconds\tinput_mode\tskeleton_gfa"
     )?;
     for summary in summaries {
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}",
             summary.organelle.as_str(),
             summary.profile.as_str(),
             summary.repeat_aware_resolution,
@@ -1207,6 +1323,16 @@ fn write_run_manifest(path: &Path, summaries: &[RunSummary]) -> Result<(), Orgra
             summary.selected_graph.display(),
             summary.output_gfa.display(),
             summary.elapsed_seconds,
+            if summary.skeleton_gfa.is_some() {
+                "skeleton_gfa_repair"
+            } else {
+                "de_novo_reads"
+            },
+            summary
+                .skeleton_gfa
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
         )?;
     }
     Ok(())
@@ -1224,6 +1350,11 @@ Use the recruited organelle FASTQ/FASTQ.GZ from `orgraft recruit`. OrgRAFT
 records the original path and creates a local `reads.fastq.gz` symlink when the
 platform supports symlinks.
 
+With `--skeleton-gfa FILE --stable`, the supplied GFA replaces de novo anchor
+graph construction. Reads remain mandatory only as remapping evidence for depth
+and link support. These values require cautious interpretation when the reads and
+GFA came from different recruitment, splitting, correction, or subset choices.
+
 ## 02.anchor_graph_core
 
 Run one organelle profile, not a batch of modes. `standard` is the baseline
@@ -1237,6 +1368,9 @@ profile-specific differences:
   uses the skeleton-link workflow.
 - `--stable`: standard plus opt-in repeat-aware topology resolution for complex
   mitochondrial or plastid graphs.
+- `--skeleton-gfa`: a dedicated repair route that skips de novo anchor graph
+  construction, remaps the supplied reads to the provided graph, and runs the
+  repeat-aware stable steps.
 - high: standard plus deterministic read-subset candidates, selected after
   assembly by topology first and posterior `read_bases / graph_bases` near
   300x. Plastid high wraps the direct-anchor workflow; mito high wraps the
@@ -1261,6 +1395,12 @@ The assembly core then:
    from the direct-anchor graph or selected from skeleton evidence.
 8. `08.workflow_summary`: write `report.txt` and `manifest.tsv` for every
    workflow; skipped steps are recorded in the report.
+
+In skeleton-GFA repair mode, Steps 01, 03, and 04 are explicitly skipped; Step 02
+records the provided GFA; Step 05 remaps reads; and Steps 06-08 repair and publish
+the graph. The repair reader consumes GFA1 S/L topology with inline sequences.
+Other record types and arbitrary input tags are not preserved, and input links
+without RC:i support must earn sufficient remapping support.
 
 ## 03.finalize_graph
 
@@ -1388,7 +1528,8 @@ mod tests {
         ));
         assert!(!HELP.contains("<out-dir>/<organelle>/03.finalize_graph/graph.gfa"));
         assert!(!HELP.contains("Workflow frame:"));
-        assert!(!HELP.contains("--stable"));
+        assert!(HELP.contains("--skeleton-gfa FILE"));
+        assert!(HELP.contains("Treat recalculated depth and link support cautiously"));
         assert!(!HELP.contains("Profiles are presets on one 01-08 workflow frame"));
     }
 
@@ -1402,6 +1543,7 @@ mod tests {
         assert!(PROFILE_HELP.contains(
             "--stable                  opt-in repeat-aware topology resolution for mito or plastid"
         ));
+        assert!(PROFILE_HELP.contains("--skeleton-gfa FILE"));
         assert!(PROFILE_HELP.contains("--keep-debug-files"));
     }
 
@@ -1501,6 +1643,7 @@ mod tests {
         assert_eq!(options.threads, DEFAULT_THREADS);
         assert!(options.finalize_dedup_rc_links);
         assert_eq!(options.image_reference_fasta, None);
+        assert_eq!(options.input.skeleton_gfa, None);
     }
 
     #[test]
@@ -1551,6 +1694,7 @@ mod tests {
 
         assert_eq!(options.input.profile, AsmProfile::Standard);
         assert!(options.input.repeat_aware_resolution);
+        assert_eq!(options.input.skeleton_gfa, None);
     }
 
     #[test]
@@ -1599,6 +1743,101 @@ mod tests {
         assert_eq!(options.input.organelle, Organelle::Plastid);
         assert_eq!(options.input.profile, AsmProfile::Standard);
         assert!(options.input.repeat_aware_resolution);
+        assert_eq!(options.input.skeleton_gfa, None);
+    }
+
+    #[test]
+    fn skeleton_gfa_stable_mode_uses_reads_as_repair_evidence() {
+        let options = AsmOptions::from_args(&[
+            "--reads".to_string(),
+            "plastid.fastq.gz".to_string(),
+            "--organelle".to_string(),
+            "plastid".to_string(),
+            "--skeleton-gfa".to_string(),
+            "checked.gfa".to_string(),
+            "--stable".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.input.organelle, Organelle::Plastid);
+        assert!(options.input.repeat_aware_resolution);
+        assert_eq!(
+            options.input.skeleton_gfa,
+            Some(PathBuf::from("checked.gfa"))
+        );
+    }
+
+    #[test]
+    fn skeleton_gfa_requires_stable() {
+        let error = AsmOptions::from_args(&[
+            "--reads".to_string(),
+            "plastid.fastq.gz".to_string(),
+            "--organelle".to_string(),
+            "plastid".to_string(),
+            "--skeleton-gfa".to_string(),
+            "checked.gfa".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("--skeleton-gfa requires --stable"));
+    }
+
+    #[test]
+    fn skeleton_gfa_rejects_read_subset_profiles() {
+        for extra in [
+            vec!["--profile".to_string(), "low".to_string()],
+            vec!["--profile".to_string(), "high".to_string()],
+            vec!["--subsets".to_string(), "50".to_string()],
+            vec!["--min-graph-coverage".to_string(), "12".to_string()],
+            vec!["--branch-ratio".to_string(), "0.2".to_string()],
+        ] {
+            let mut args = vec![
+                "--reads".to_string(),
+                "plastid.fastq.gz".to_string(),
+                "--organelle".to_string(),
+                "plastid".to_string(),
+                "--skeleton-gfa".to_string(),
+                "checked.gfa".to_string(),
+                "--stable".to_string(),
+            ];
+            args.extend(extra);
+            let error = AsmOptions::from_args(&args).unwrap_err();
+            assert!(error.to_string().contains("requires --profile standard"));
+        }
+    }
+
+    #[test]
+    fn force_repair_refuses_to_delete_skeleton_source() {
+        let dir = test_dir("asm_skeleton_force_guard");
+        let out_dir = dir.join("repair");
+        let source_gfa = out_dir.join("plastid/03.finalize_graph/graph.edited.gfa");
+        let reads = dir.join("reads.fastq");
+        fs::create_dir_all(source_gfa.parent().unwrap()).unwrap();
+        fs::write(&source_gfa, "S\tu1\tAAAA\n").unwrap();
+        fs::write(&reads, "@r1\nAAAA\n+\nIIII\n").unwrap();
+
+        let options = AsmOptions::from_args(&[
+            "--reads".to_string(),
+            reads.display().to_string(),
+            "--organelle".to_string(),
+            "plastid".to_string(),
+            "--skeleton-gfa".to_string(),
+            source_gfa.display().to_string(),
+            "--stable".to_string(),
+            "--out-dir".to_string(),
+            out_dir.display().to_string(),
+            "--force".to_string(),
+        ])
+        .unwrap();
+        let error = run_one_input(&options, &options.input).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("inside outputs that --force would remove"));
+        assert_eq!(fs::read_to_string(&source_gfa).unwrap(), "S\tu1\tAAAA\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn test_dir(name: &str) -> PathBuf {

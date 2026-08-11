@@ -30,7 +30,7 @@ OrgRAFT Rust CLI
   setup       external tool and Python package checks
   workflow    config template, command generation, checkpoints, summaries
   recruit     read recruitment
-  asm         conservative graph construction
+  asm         conservative graph construction or read-backed supplied-GFA repair
   resolve     checked graph orientation, conservative merge, subgraph export
   polish      polished linear sequence and variant/read-support validation
   rebuild     final verified graph/FASTA reconstruction and compact reports
@@ -55,7 +55,7 @@ Workflow-generated roots are numbered for the major products:
 | Stage | Core outputs | Notes |
 | --- | --- | --- |
 | `recruit` | `mito.fastq.gz`, `plastid.fastq.gz`, `logs/bait.fasta`, `logs/recruitment_summary.tsv`, `logs/read_stats.tsv` | `pigz` may be used for fast gzip IO |
-| `asm` | `ORGANELLE/03.finalize_graph/graph.gfa`, optional `graph.edited.gfa`, `ORGANELLE/logs/*.tsv` | The finalize graph removes reverse-complement duplicate `L` records by default while preserving intermediate evidence |
+| `asm` | `ORGANELLE/03.finalize_graph/graph.gfa`, optional `graph.edited.gfa`, `ORGANELLE/logs/*.tsv` | Normal mode builds from reads. Standalone `--skeleton-gfa --stable` records Steps 01/03/04 as skipped, stages the supplied GFA at Step 02, recomputes read evidence at Step 05, repairs at Step 06, and publishes through Steps 07-08. The finalize graph removes reverse-complement duplicate `L` records by default. |
 | `workflow checkpoint1` | `checkpoint_1.status.tsv`, `checked_draft.gfa`, optional `manual_edit_required.gfa` | Topology and GFA consistency gate before resolve |
 | `resolve` | `ORGANELLE/graph/merged_unresolved.gfa`, `merged_unresolved_subgraph_001.gfa`, `ORGANELLE/fasta/rotated_reference.fasta`, `resolved_subgraphs.fasta`, `logs/resolve_details.tsv` | Uses checked draft graph plus reference FASTA |
 | `polish` | `ORGANELLE/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}`; round 2+ leaves `02.polish` empty and validates `01.inputs/linear_subgraph.round_N.fasta` | Plot scripts require `matplotlib` |

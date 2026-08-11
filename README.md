@@ -26,7 +26,7 @@ orgraft workflow    # generate and run config-driven workflow checkpoints
 
 -- Raw graph generation
 orgraft recruit     # organelle HiFi read recruitment
-orgraft asm         # conservative draft graph assembly
+orgraft asm         # conservative draft assembly or read-backed GFA repair
 
 -- High-quality graph generation
 orgraft resolve     # resolve checked draft GFA into reference-oriented products
@@ -36,6 +36,19 @@ orgraft rebuild     # rebuild final verified graph and compact reports
 
 Run any command without arguments, or with `--help`, to print its current
 interface.
+
+Standalone repair of a candidate or manually edited GFA is available without
+rerunning de novo graph construction:
+
+```bash
+orgraft asm --reads recruited.fastq.gz --organelle plastid \
+  --skeleton-gfa graph.edited.gfa --stable --out-dir results/gfa_repair_r01
+```
+
+This mode still remaps reads to the supplied graph. Depth and link support are
+conditional on that graph and read set, and the repaired output must pass the
+ordinary checkpoint-1 review before `resolve`. Workflow TOML does not currently
+generate this standalone repair command.
 
 ## Quick Start
 

@@ -291,6 +291,41 @@ orgraft polish --organelle mito --subgraph subgraph_001 --draft resolved_subgrap
 orgraft rebuild --organelle mito --subgraph subgraph_001 --edited-gfa checked_draft.gfa --polished-fasta polish_aln_v2.fasta
 ```
 
+### Standalone read-backed GFA repair
+
+Use `--skeleton-gfa FILE --stable` when a candidate or manually edited graph
+should enter repeat-aware repair without rebuilding anchor walks and unitigs from
+reads:
+
+```bash
+orgraft asm \
+  --reads results_workflow/01.recruit/plastid.fastq.gz \
+  --organelle plastid \
+  --skeleton-gfa graph.edited.gfa \
+  --stable \
+  --soft-paths soft_paths.txt \
+  --out-dir results/gfa_repair_r01
+```
+
+`--out-dir` is a new assembly root; the public result is written to
+`results/gfa_repair_r01/plastid/03.finalize_graph/graph.gfa`. Do not point it at
+an existing `03.finalize_graph` directory. Repair mode requires the standard
+profile and rejects `--subsets`, `--min-graph-coverage`, and `--branch-ratio`.
+
+The supplied GFA replaces de novo Steps 01-02. Reads remain required as remapping
+evidence: Steps 01, 03, and 04 are reported as skipped, Step 02 records the
+provided GFA, Step 05 recalculates skeleton depth/link evidence, Step 06 performs
+repeat-aware repair, and Steps 07-08 publish the handoff and provenance.
+
+Treat depth and link support cautiously. They depend on the supplied node
+boundaries, minimap2 filters, and the exact recruitment/splitting/subsetting
+history of the evidence reads; reads reused from graph construction are not an
+independent validation set. Input links without `RC:i` support must earn enough
+read-remapping support to remain. The repair reader accepts GFA1 `S`/`L` topology
+with unique segment IDs, inline sequences, valid `+/-` orientations, and declared
+link endpoints. The repaired graph is reconstructed and does not preserve `P`,
+`W`, or arbitrary custom tags. Run checkpoint 1 again before `resolve`.
+
 Standalone command defaults remain command-local, such as `results/recruit`,
 `results/draft_asm`, `resolve_gfa`, `results/polish`, and `results/rebuild`.
 The workflow template overrides them with numbered roots under `results_dir`.

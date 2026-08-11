@@ -52,6 +52,8 @@ const REPEAT_PATH_MIN_IDENTITY: f64 = 0.95;
 // candidate generator; two independent node placements must still anchor it.
 const REPEAT_CORE_MIN_ALIGNMENT_BP: usize = 500;
 const REPEAT_CORE_DEFAULT_ALIGNMENT_BP: usize = 1_000;
+const REPEAT_ASSIGNMENT_MIN_ALIGNED_FRACTION: f64 = 0.75;
+const REPEAT_ASSIGNMENT_MIN_SUBSTITUTION_IDENTITY: f64 = 0.99;
 
 pub fn run(args: &[String]) -> Result<(), OrgraftError> {
     if args.is_empty() {
@@ -1187,6 +1189,8 @@ struct PafHit {
     matches: usize,
     block_length: usize,
     mapq: usize,
+    substitution_matches: usize,
+    substitution_mismatches: usize,
     primary: bool,
 }
 
@@ -1203,6 +1207,16 @@ impl PafHit {
             0.0
         } else {
             (self.query_end.saturating_sub(self.query_start)) as f64 / self.query_length as f64
+        }
+    }
+    fn substitution_identity(&self) -> f64 {
+        let total = self
+            .substitution_matches
+            .saturating_add(self.substitution_mismatches);
+        if total == 0 {
+            self.identity()
+        } else {
+            self.substitution_matches as f64 / total as f64
         }
     }
     fn folded(&self, reference_len: usize) -> FoldedInterval {
@@ -1591,7 +1605,7 @@ fn infer_verified_sequences_from_repeat_cores(
                 length: sequence.len(),
                 parts: format!("{}-{}:{}", copy.start, copy.end, strand),
                 notes: format!(
-                    "core_copies={};blast_length={};blast_pident={:.3};boundary_extension_left={};boundary_extension_right={}",
+                    "core_copies={};blast_length={};blast_pident={:.3};boundary_extension_left={};boundary_extension_right={};repeat_pair_anchor={}",
                     pair.copies
                         .iter()
                         .map(|item| format!("{}-{}:{}", item.start, item.end, item.strand))
@@ -1600,7 +1614,12 @@ fn infer_verified_sequences_from_repeat_cores(
                     pair.source_blast_length,
                     pair.source_pident,
                     pair.boundary_extension_left,
-                    pair.boundary_extension_right
+                    pair.boundary_extension_right,
+                    if mapping.by_node[name].accepted_hits.len() >= 2 {
+                        "strict_block_identity"
+                    } else {
+                        "indel_tolerant_secondary"
+                    }
                 ),
             });
         }
@@ -2078,23 +2097,30 @@ fn assign_repeat_nodes_to_core_pairs(
         if node_classes[name] != "repeat_node" {
             continue;
         }
-        let mut best_index = None;
-        let mut best_score = 0usize;
+        let node_mapping = &mapping.by_node[name];
+        let relaxed_anchor = node_mapping.accepted_hits.len() < 2;
+        let mut candidates = Vec::new();
         for (index, pair) in core_pairs.iter().enumerate() {
             if used.contains(&index) {
                 continue;
             }
-            let Some(score) =
-                repeat_pair_mapping_score(&mapping.by_node[name], pair, mapping.reference_len)
+            let Some(score) = repeat_pair_mapping_score(node_mapping, pair, mapping.reference_len)
             else {
                 continue;
             };
-            if best_index.is_none() || score > best_score {
-                best_index = Some(index);
-                best_score = score;
-            }
+            candidates.push((index, score));
         }
-        if let Some(index) = best_index {
+        let selected = if relaxed_anchor {
+            // A relaxed repeat anchor must identify exactly one self-BLAST core pair.
+            // Ambiguous pairs remain fail-closed and use the existing fallback plan.
+            (candidates.len() == 1).then_some(candidates[0].0)
+        } else {
+            candidates
+                .into_iter()
+                .max_by_key(|(_, score)| *score)
+                .map(|(index, _)| index)
+        };
+        if let Some(index) = selected {
             used.insert(index);
             assignments.insert(name.clone(), core_pairs[index].clone());
         }
@@ -2102,28 +2128,50 @@ fn assign_repeat_nodes_to_core_pairs(
     assignments
 }
 
+fn repeat_assignment_hits(mapping: &NodeMapping, reference_len: usize) -> Vec<PafHit> {
+    if mapping.accepted_hits.len() >= 2 {
+        return mapping.accepted_hits.clone();
+    }
+    dedupe_hits(
+        mapping
+            .all_hits
+            .iter()
+            .filter(|hit| {
+                hit.aligned_fraction() >= REPEAT_ASSIGNMENT_MIN_ALIGNED_FRACTION
+                    && hit.substitution_identity() >= REPEAT_ASSIGNMENT_MIN_SUBSTITUTION_IDENTITY
+            })
+            .cloned()
+            .collect(),
+        reference_len,
+    )
+}
+
 fn repeat_pair_mapping_score(
     mapping: &NodeMapping,
     pair: &RepeatCorePair,
     reference_len: usize,
 ) -> Option<usize> {
-    if pair.copies.len() != 2 || mapping.accepted_hits.len() < 2 {
+    if pair.copies.len() != 2 {
+        return None;
+    }
+    let assignment_hits = repeat_assignment_hits(mapping, reference_len);
+    if assignment_hits.len() < 2 {
         return None;
     }
     let required_overlap = pair.length.saturating_mul(3).div_ceil(4);
     let mut best = None;
-    for first_index in 0..mapping.accepted_hits.len() {
-        for second_index in 0..mapping.accepted_hits.len() {
+    for first_index in 0..assignment_hits.len() {
+        for second_index in 0..assignment_hits.len() {
             if first_index == second_index {
                 continue;
             }
             let first_overlap = circular_hit_interval_overlap(
-                &mapping.accepted_hits[first_index],
+                &assignment_hits[first_index],
                 &pair.copies[0],
                 reference_len,
             );
             let second_overlap = circular_hit_interval_overlap(
-                &mapping.accepted_hits[second_index],
+                &assignment_hits[second_index],
                 &pair.copies[1],
                 reference_len,
             );
@@ -2359,6 +2407,8 @@ fn make_synthetic_hit(
         matches: query_end - query_start + 1,
         block_length: query_end - query_start + 1,
         mapq: 60,
+        substitution_matches: query_end - query_start + 1,
+        substitution_mismatches: 0,
         primary: true,
     }
 }
@@ -4049,6 +4099,48 @@ fn graph_stats(gfa: &Gfa) -> GraphStats {
     }
 }
 
+fn parse_eqx_counts(cigar: &str) -> Result<(usize, usize), OrgraftError> {
+    let mut length = 0usize;
+    let mut has_length = false;
+    let mut exact = 0usize;
+    let mut mismatch = 0usize;
+    for character in cigar.chars() {
+        if character.is_ascii_digit() {
+            length = length
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(character.to_digit(10).unwrap() as usize))
+                .ok_or_else(|| {
+                    OrgraftError::InvalidArgument(format!("CIGAR length overflow: {cigar}"))
+                })?;
+            has_length = true;
+            continue;
+        }
+        if !has_length {
+            return Err(OrgraftError::InvalidArgument(format!(
+                "malformed CIGAR operation in `{cigar}`"
+            )));
+        }
+        match character {
+            '=' => exact = exact.saturating_add(length),
+            'X' => mismatch = mismatch.saturating_add(length),
+            'M' | 'I' | 'D' | 'N' | 'S' | 'H' | 'P' => {}
+            _ => {
+                return Err(OrgraftError::InvalidArgument(format!(
+                    "unsupported CIGAR operation `{character}` in `{cigar}`"
+                )))
+            }
+        }
+        length = 0;
+        has_length = false;
+    }
+    if has_length {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "trailing CIGAR length in `{cigar}`"
+        )));
+    }
+    Ok((exact, mismatch))
+}
+
 fn parse_paf(line: &str) -> Result<PafHit, OrgraftError> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
@@ -4056,6 +4148,14 @@ fn parse_paf(line: &str) -> Result<PafHit, OrgraftError> {
             "malformed PAF line: {line}"
         )));
     }
+    let matches = parse_usize_value(fields[9], "PAF matches")?;
+    let block_length = parse_usize_value(fields[10], "PAF block length")?;
+    let (substitution_matches, substitution_mismatches) = fields
+        .iter()
+        .find_map(|field| field.strip_prefix("cg:Z:"))
+        .map(parse_eqx_counts)
+        .transpose()?
+        .unwrap_or_else(|| (matches, block_length.saturating_sub(matches)));
     Ok(PafHit {
         query_name: fields[0].to_string(),
         query_length: parse_usize_value(fields[1], "PAF query length")?,
@@ -4064,9 +4164,11 @@ fn parse_paf(line: &str) -> Result<PafHit, OrgraftError> {
         strand: parse_strand(fields[4])?,
         target_start: parse_usize_value(fields[7], "PAF target start")?,
         target_end: parse_usize_value(fields[8], "PAF target end")?,
-        matches: parse_usize_value(fields[9], "PAF matches")?,
-        block_length: parse_usize_value(fields[10], "PAF block length")?,
+        matches,
+        block_length,
         mapq: parse_usize_value(fields[11], "PAF mapq")?,
+        substitution_matches,
+        substitution_mismatches,
         primary: fields.iter().any(|field| *field == "tp:A:P"),
     })
 }
@@ -4959,6 +5061,111 @@ mod tests {
     }
 
     #[test]
+    fn repeat_core_assignment_rescues_indel_heavy_two_copy_anchors() {
+        let pair = RepeatCorePair {
+            length: 1_000,
+            source_blast_length: 1_000,
+            source_pident: 100.0,
+            source_gapopen: 0,
+            source_mismatch: 0,
+            boundary_extension_left: 0,
+            boundary_extension_right: 0,
+            copies: vec![
+                RepeatCopy {
+                    start: 1_000,
+                    end: 1_999,
+                    strand: '+',
+                },
+                RepeatCopy {
+                    start: 5_000,
+                    end: 5_999,
+                    strand: '-',
+                },
+            ],
+        };
+        let make_indel_heavy_hit = |target_start, target_end, strand| PafHit {
+            query_name: "repeat".to_string(),
+            query_length: 1_000,
+            query_start: 0,
+            query_end: 1_000,
+            strand,
+            target_start,
+            target_end,
+            matches: 979,
+            block_length: 1_000,
+            mapq: 0,
+            substitution_matches: 979,
+            substitution_mismatches: 1,
+            primary: true,
+        };
+        let hits = vec![
+            make_indel_heavy_hit(999, 1_979, '+'),
+            make_indel_heavy_hit(4_999, 5_979, '-'),
+        ];
+        let mapping = NodeMapping {
+            selected: hits.first().cloned(),
+            accepted_hits: Vec::new(),
+            all_hits: hits,
+        };
+
+        assert_eq!(
+            repeat_pair_mapping_score(&mapping, &pair, 20_000),
+            Some(1_960)
+        );
+    }
+
+    #[test]
+    fn repeat_core_assignment_rejects_substitution_heavy_relaxed_hits() {
+        let pair = RepeatCorePair {
+            length: 1_000,
+            source_blast_length: 1_000,
+            source_pident: 100.0,
+            source_gapopen: 0,
+            source_mismatch: 0,
+            boundary_extension_left: 0,
+            boundary_extension_right: 0,
+            copies: vec![
+                RepeatCopy {
+                    start: 1_000,
+                    end: 1_999,
+                    strand: '+',
+                },
+                RepeatCopy {
+                    start: 5_000,
+                    end: 5_999,
+                    strand: '-',
+                },
+            ],
+        };
+        let make_substitution_heavy_hit = |target_start, target_end, strand| PafHit {
+            query_name: "repeat".to_string(),
+            query_length: 1_000,
+            query_start: 0,
+            query_end: 1_000,
+            strand,
+            target_start,
+            target_end,
+            matches: 979,
+            block_length: 1_000,
+            mapq: 0,
+            substitution_matches: 979,
+            substitution_mismatches: 21,
+            primary: true,
+        };
+        let hits = vec![
+            make_substitution_heavy_hit(999, 1_979, '+'),
+            make_substitution_heavy_hit(4_999, 5_979, '-'),
+        ];
+        let mapping = NodeMapping {
+            selected: hits.first().cloned(),
+            accepted_hits: Vec::new(),
+            all_hits: hits,
+        };
+
+        assert_eq!(repeat_pair_mapping_score(&mapping, &pair, 20_000), None);
+    }
+
+    #[test]
     fn circular_projection_dedupes_wrap_and_truncated_same_placement() {
         let make_hit = |query_start, query_end, target_start, target_end| PafHit {
             query_name: "long_node".to_string(),
@@ -4971,6 +5178,8 @@ mod tests {
             matches: query_end - query_start,
             block_length: query_end - query_start,
             mapq: 60,
+            substitution_matches: query_end - query_start,
+            substitution_mismatches: 0,
             primary: query_start == 0,
         };
         let reference_len = 339_849;
