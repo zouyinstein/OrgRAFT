@@ -294,8 +294,8 @@ orgraft rebuild --organelle mito --subgraph subgraph_001 --edited-gfa checked_dr
 ### Standalone read-backed GFA repair
 
 Use `--skeleton-gfa FILE --stable` when a candidate or manually edited graph
-should enter repeat-aware repair without rebuilding anchor walks and unitigs from
-reads:
+should enter read-backed open-end link repair without rebuilding anchor walks
+and unitigs from reads:
 
 ```bash
 orgraft asm \
@@ -314,8 +314,10 @@ profile and rejects `--subsets`, `--min-graph-coverage`, and `--branch-ratio`.
 
 The supplied GFA replaces de novo Steps 01-02. Reads remain required as remapping
 evidence: Steps 01, 03, and 04 are reported as skipped, Step 02 records the
-provided GFA, Step 05 recalculates skeleton depth/link evidence, Step 06 performs
-repeat-aware repair, and Steps 07-08 publish the handoff and provenance.
+provided GFA, Step 05 recalculates skeleton depth/link evidence, Step 06 evaluates
+read-backed links between open endpoints, and Steps 07-08 publish the handoff and
+provenance. Automatic triplet/copy-choice, internal-split, repeat-expansion, and
+redundant-link-pruning rewrites are disabled in the production Stable route.
 
 Treat depth and link support cautiously. They depend on the supplied node
 boundaries, minimap2 filters, and the exact recruitment/splitting/subsetting

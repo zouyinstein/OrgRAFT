@@ -1178,7 +1178,7 @@ fn run_two_round_skeleton_workflow(config: &Config, started: Instant) -> io::Res
             config,
             &bridge_rescue_dir,
             "skipped",
-            "low-depth bridge rescue is not required for repeat-aware stable workflow",
+            "low-depth bridge rescue is not required for the open-end-only stable workflow",
             &read_junction_dir,
             &link_evidence_dir,
             false,
@@ -1297,7 +1297,7 @@ fn run_skeleton_gfa_repair_workflow(config: &Config, started: Instant) -> io::Re
         &bridge_rescue_dir,
         "04.low_depth_bridge_rescue",
         "skipped",
-        "skeleton-GFA repair proceeds directly to read remapping and repeat-aware resolution",
+        "skeleton-GFA repair proceeds directly to read remapping and optional stable open-end repair",
         Some(&seed_graph_dir),
         None,
     )?;
@@ -2363,7 +2363,7 @@ fn write_profile_parameter_report(path: &Path, config: &Config) -> io::Result<()
         standard.mito_stable.to_string(),
         config.mito_stable.to_string(),
         "",
-        "opt-in stable parameter enables repeat-aware topology resolution",
+        "opt-in stable parameter enables read-backed open-end link repair",
     )?;
     write_profile_parameter_row(
         &mut out,
@@ -5291,6 +5291,11 @@ const MITO_COMPACT_MAX_ENDPOINT_DEGREE: usize = 2;
 const MITO_COMPACT_SMALL_COMPONENT_MAX_SEGMENTS: usize = 3;
 const MITO_COMPACT_SMALL_COMPONENT_MAX_BASES: usize = 30_000;
 
+// Stable mode is currently restricted to automatic link repair between open
+// endpoints. Keep the non-open-end implementations below for provenance and
+// possible re-evaluation, but do not enter them from the production workflow.
+const MITO_STABLE_OPEN_END_REPAIR_ONLY: bool = true;
+
 #[derive(Debug, Clone)]
 struct SkeletonGraphStats {
     components: Vec<Vec<String>>,
@@ -5604,7 +5609,11 @@ fn run_mito_stable_resolution(config: &Config, resolution_dir: &Path) -> io::Res
     let paf_path = config.out_dir.join("read_alignments.paf");
     let log_path = config.out_dir.join("read_alignments.minimap2.log");
     let mut paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
-    let split_points = detect_mito_stable_internal_split_points(config, &segments, &paf_by_read);
+    let split_points = if MITO_STABLE_OPEN_END_REPAIR_ONLY {
+        HashMap::new()
+    } else {
+        detect_mito_stable_internal_split_points(config, &segments, &paf_by_read)
+    };
     let mut split_report = Vec::new();
     let mut candidates = Vec::new();
     if !split_points.is_empty() {
@@ -5684,10 +5693,26 @@ fn run_mito_stable_resolution(config: &Config, resolution_dir: &Path) -> io::Res
     candidates.extend(mito_compact_rescue_candidates(&initial_stats, rescue_links));
     let all_candidates = dedupe_mito_bridge_candidates(candidates);
     let all_candidate_count = all_candidates.len();
-    let copy_choice_rows =
-        analyze_mito_stable_copy_choices(config, &segments, &base_links, &all_candidates);
-    let selected_node_diagnostics =
-        analyze_mito_stable_selected_nodes(config, &segments, &base_links, &all_candidates);
+    let all_candidates = if MITO_STABLE_OPEN_END_REPAIR_ONLY {
+        all_candidates
+            .into_iter()
+            .filter(|candidate| {
+                mito_stable_candidate_closes_open_ends(&initial_stats, &candidate.key)
+            })
+            .collect()
+    } else {
+        all_candidates
+    };
+    let copy_choice_rows = if MITO_STABLE_OPEN_END_REPAIR_ONLY {
+        Vec::new()
+    } else {
+        analyze_mito_stable_copy_choices(config, &segments, &base_links, &all_candidates)
+    };
+    let selected_node_diagnostics = if MITO_STABLE_OPEN_END_REPAIR_ONLY {
+        Vec::new()
+    } else {
+        analyze_mito_stable_selected_nodes(config, &segments, &base_links, &all_candidates)
+    };
     let candidates = mito_stable_scoped_candidates(config, all_candidates.clone());
 
     let base_topology = mito_stable_topology_stats(config, &segments, &base_links);
@@ -5738,7 +5763,9 @@ fn run_mito_stable_resolution(config: &Config, resolution_dir: &Path) -> io::Res
     }
     let manual_edits = apply_mito_stable_manual_edits(config, &mut final_links);
     refresh_skeleton_link_ratios(config, &mut final_links);
-    let repeat_expansions = if config.mito_stable_selection_mode == MitoStableSelectionMode::Auto {
+    let repeat_expansions = if !MITO_STABLE_OPEN_END_REPAIR_ONLY
+        && config.mito_stable_selection_mode == MitoStableSelectionMode::Auto
+    {
         let expansions = expand_mito_stable_repeat_shortcuts(
             config,
             &mut segments,
@@ -5751,7 +5778,9 @@ fn run_mito_stable_resolution(config: &Config, resolution_dir: &Path) -> io::Res
     } else {
         Vec::new()
     };
-    let pruned_links = if config.mito_stable_selection_mode == MitoStableSelectionMode::Auto {
+    let pruned_links = if !MITO_STABLE_OPEN_END_REPAIR_ONLY
+        && config.mito_stable_selection_mode == MitoStableSelectionMode::Auto
+    {
         prune_mito_stable_redundant_links(config, &segments, &mut final_links)
     } else {
         Vec::new()
@@ -8287,6 +8316,16 @@ fn mito_compact_candidate_is_relevant(stats: &SkeletonGraphStats, key: &Skeleton
         || stats.open_in.contains(&(key.to.clone(), key.to_orient))
 }
 
+fn mito_stable_candidate_closes_open_ends(
+    stats: &SkeletonGraphStats,
+    key: &SkeletonLinkKey,
+) -> bool {
+    stats
+        .open_out
+        .contains(&(key.from.clone(), key.from_orient))
+        && stats.open_in.contains(&(key.to.clone(), key.to_orient))
+}
+
 fn insert_mito_compact_bridge(
     config: &Config,
     links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
@@ -8718,14 +8757,28 @@ fn write_mito_stable_bridge_report(
     writeln!(out, "status\tresolved")?;
     writeln!(
         out,
-        "reason\trepeat-aware stable workflow resolved candidate links and topology repairs"
+        "reason\tstable workflow evaluated read-backed open-end link repairs"
     )?;
     writeln!(out, "input_dir\t{}", input_dir.display())?;
     writeln!(out, "output_dir\t{}", config.out_dir.display())?;
     writeln!(out, "section\tskeleton_link_summary")?;
     write_skeleton_report_fields(&mut out, config, skeleton_gfa, segments, links)?;
     writeln!(out, "section\trepeat_aware_selection")?;
-    writeln!(out, "mode\tglobal_candidate_selection")?;
+    writeln!(out, "mode\topen_end_link_selection")?;
+    writeln!(
+        out,
+        "automatic_scope\t{}",
+        if MITO_STABLE_OPEN_END_REPAIR_ONLY {
+            "open_end_links_only"
+        } else {
+            "extended_topology_rewrites"
+        }
+    )?;
+    writeln!(
+        out,
+        "non_open_end_topology_rewrites_enabled\t{}",
+        !MITO_STABLE_OPEN_END_REPAIR_ONLY
+    )?;
     writeln!(
         out,
         "selection_mode\t{}",
@@ -10678,6 +10731,24 @@ mod tests {
         );
         assert!(stats.open_out.contains(&("utg1".to_string(), '+')));
         assert!(stats.open_in.contains(&("utg0".to_string(), '+')));
+
+        let closes_both = SkeletonLinkKey {
+            from: "utg1".to_string(),
+            from_orient: '+',
+            to: "utg0".to_string(),
+            to_orient: '+',
+        };
+        let touches_occupied_roles = SkeletonLinkKey {
+            from: "utg0".to_string(),
+            from_orient: '+',
+            to: "utg1".to_string(),
+            to_orient: '+',
+        };
+        assert!(mito_stable_candidate_closes_open_ends(&stats, &closes_both));
+        assert!(!mito_stable_candidate_closes_open_ends(
+            &stats,
+            &touches_occupied_roles
+        ));
     }
 
     #[test]

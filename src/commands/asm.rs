@@ -78,7 +78,7 @@ Workflow frame:
   03.read_junction_graph       skeleton-link rescue evidence; skipped for direct-anchor
   04.low_depth_bridge_rescue   mito low extra step; otherwise skipped
   05.skeleton_link_evidence    mito skeleton-link evidence; skipped for direct-anchor
-  06.repeat_aware_resolution   --stable extra step; otherwise skipped
+  06.repeat_aware_resolution   --stable open-end link repair; otherwise skipped
   07.linked_graph              common selected graph handoff
   08.workflow_summary          reports exact active values and skipped steps
 
@@ -90,7 +90,7 @@ Use `--finalize-dedup-rc-links off` to publish the selected graph unchanged.
 Each run writes exact active values to 08.workflow_summary/profile_parameters.tsv
 
 Advanced parameters:
-  --stable                  opt-in repeat-aware topology resolution for mito or plastid
+  --stable                  opt-in read-backed open-end link repair for mito or plastid
   --skeleton-gfa FILE       repair this GFA directly with --stable; skips de novo assembly
   --min-graph-coverage N    override shared anchor/edge coverage floor
   --min-link-ratio FLOAT    optional weak-link ratio filter
@@ -517,7 +517,7 @@ impl AsmOptions {
         })?;
         if skeleton_gfa.is_some() && !stable {
             return Err(OrgraftError::InvalidArgument(
-                "--skeleton-gfa requires --stable because it is only supported for repeat-aware GFA repair"
+                "--skeleton-gfa requires --stable because it is only supported for read-backed open-end GFA repair"
                     .to_string(),
             ));
         }
@@ -1200,27 +1200,27 @@ fn write_core_output_manifest(path: &Path, work_dir: &Path) -> Result<(), Orgraf
         (
             "06.repeat_aware_resolution/report.txt",
             "06.repeat_aware_resolution",
-            "repeat-aware resolution, skeleton-link summary, and topology repair report",
+            "open-end link repair, skeleton-link summary, and topology report",
         ),
         (
             "06.repeat_aware_resolution/node_repairs.tsv",
             "06.repeat_aware_resolution",
-            "compact node-level summary of repeat-aware repairs and selected links",
+            "compact node-level summary of open-end repairs and selected links",
         ),
         (
             "06.repeat_aware_resolution/links.tsv",
             "06.repeat_aware_resolution",
-            "links retained after repeat-aware resolution",
+            "links retained after stable open-end repair",
         ),
         (
             "06.repeat_aware_resolution/depth.tsv",
             "06.repeat_aware_resolution",
-            "depth retained after repeat-aware resolution",
+            "depth retained after stable open-end repair",
         ),
         (
             "06.repeat_aware_resolution/graph.gfa",
             "06.repeat_aware_resolution",
-            "repeat-aware resolved graph before final handoff",
+            "open-end-repaired graph before final handoff",
         ),
         (
             "07.linked_graph/graph.gfa",
@@ -1366,11 +1366,11 @@ profile-specific differences:
   Step 04.
 - standard: organelle defaults; plastid uses the direct-anchor workflow, mito
   uses the skeleton-link workflow.
-- `--stable`: standard plus opt-in repeat-aware topology resolution for complex
-  mitochondrial or plastid graphs.
+- `--stable`: standard plus opt-in read-backed repair of links between open
+  endpoints in mitochondrial or plastid graphs.
 - `--skeleton-gfa`: a dedicated repair route that skips de novo anchor graph
   construction, remaps the supplied reads to the provided graph, and runs the
-  repeat-aware stable steps.
+  stable open-end repair step.
 - high: standard plus deterministic read-subset candidates, selected after
   assembly by topology first and posterior `read_bases / graph_bases` near
   300x. Plastid high wraps the direct-anchor workflow; mito high wraps the
@@ -1389,8 +1389,10 @@ The assembly core then:
    rescue handoff from read-junction evidence into skeleton-link selection.
 5. `05.skeleton_link_evidence`: for skeleton-link workflows, remap reads to
    skeleton unitigs and collect depth/link evidence.
-6. `06.repeat_aware_resolution`: for repeat-aware stable workflows, resolve
-   candidate links, copy choices, repeat expansions, and topology repairs.
+6. `06.repeat_aware_resolution`: for stable workflows, evaluate read-backed
+   candidate links between open endpoints. The directory name is retained for
+   output compatibility; automatic triplet/copy-choice and other non-open-end
+   topology rewrites are disabled.
 7. `07.linked_graph`: write the unified linked-graph handoff, either copied
    from the direct-anchor graph or selected from skeleton evidence.
 8. `08.workflow_summary`: write `report.txt` and `manifest.tsv` for every
@@ -1541,7 +1543,7 @@ mod tests {
         assert!(PROFILE_HELP.contains("--finalize-dedup-rc-links on|off"));
         assert!(PROFILE_HELP.contains("--image-reference-fasta FILE"));
         assert!(PROFILE_HELP.contains(
-            "--stable                  opt-in repeat-aware topology resolution for mito or plastid"
+            "--stable                  opt-in read-backed open-end link repair for mito or plastid"
         ));
         assert!(PROFILE_HELP.contains("--skeleton-gfa FILE"));
         assert!(PROFILE_HELP.contains("--keep-debug-files"));
