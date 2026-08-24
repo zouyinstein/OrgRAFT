@@ -2,7 +2,7 @@
 name = "orgraft"
 version = "0.4.1"
 edition = "2021"
-description = "Organelle Graph Read-backed Assembly and FASTA Traceability"
+description = "Organelle Read-backed Assembly with FASTA–Graph Traceability"
 license = "MIT"
 publish = false
 

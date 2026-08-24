@@ -1,6 +1,6 @@
 # OrgRAFT
 
-OrgRAFT means **Organelle Graph Read-backed Assembly and FASTA Traceability**.
+OrgRAFT means **Organelle Read-backed Assembly with FASTA–Graph Traceability**.
 
 This repository contains a Rust CLI for plant organelle assembly and
 post-assembly validation. The intended product is not only a final FASTA: it is

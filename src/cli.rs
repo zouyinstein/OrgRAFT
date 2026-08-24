@@ -2,7 +2,7 @@ use crate::error::OrgraftError;
 use crate::{commands, workflow};
 
 const HELP: &str = concat!(
-    "Program: orgraft (Organelle Graph Read-backed Assembly and FASTA Traceability)\n",
+    "Program: orgraft (Organelle Read-backed Assembly with FASTA–Graph Traceability)\n",
     "Version: ",
     env!("CARGO_PKG_VERSION"),
     "\n\n",
