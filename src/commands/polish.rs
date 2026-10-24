@@ -12,6 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::commands::shared::{print_contract, CommandContract};
 use crate::error::OrgraftError;
 
+#[path = "postrepair.rs"]
+pub mod postrepair;
+
 const HELP: &str = r#"orgraft polish
 
 Create a per-subgraph polish workspace and track polish/evaluation stages.
@@ -34,18 +37,26 @@ Outputs:
 Additional Parameters:
   --threads N                             worker threads [8]
   --max-rounds N                          planned validation rounds [3]
-  --validate-round N                      workflow validation round directory [1]
+  --validate-round N                      ordinary workflow validation round directory [1]
   --per-read-variant-calls on|off         run read-level SV/SNP-InDel evidence stages [on]
   --snv-indel-overlap-policy MODE         mark-overlap|mask-both|assign-downstream [mark-overlap]
   --plot-help                             show advanced plot tuning options
 
 Layout: OUT/NAME/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}
+Use orgraft postrepair to review variants remaining after ordinary validation.
+Existing --homorepair-* options remain accepted for older workflow scripts.
 "#;
+
+/// Compatibility entrypoint for older callers; the command lives in postrepair.
+pub fn run_postrepair(args: &[String]) -> Result<(), OrgraftError> {
+    postrepair::run(args)
+}
 
 const PLOT_HELP: &str = r#"orgraft polish plot parameters
 
 Common:
-  Plots are attempted automatically when validation data exists; scripts are always written.
+  Ordinary validation writes plot scripts and attempts plots automatically when data exists.
+  Internal homorepair probes write neither plot scripts nor figures; final validation keeps plotting.
   --plot-range START-END                  restrict plots to a reference interval; full length when omitted
   --plot-dpi N                            plot raster DPI [300]
   --plot-output-format png|pdf|both       plot file format [png]
@@ -190,8 +201,13 @@ pub fn run(args: &[String]) -> Result<(), OrgraftError> {
         return Ok(());
     }
 
-    let options = PolishOptions::from_args(args)?;
-    run_polish_scaffold(&options)
+    let (ordinary_args, repeat_review) = postrepair::parse_args(args)?;
+    let options = PolishOptions::from_args(&ordinary_args)?;
+    if let Some(config) = repeat_review {
+        postrepair::run_review(&options, &config)
+    } else {
+        run_polish_scaffold(&options)
+    }
 }
 
 fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
@@ -203,7 +219,34 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
         &options.subgraph,
         options.validate_round,
     );
+    run_polish_scaffold_prepared(options, inputs, paths, started)
+}
 
+fn run_polish_scaffold_at_paths(options: &PolishOptions, paths: PolishPaths) -> Result<(), OrgraftError> {
+    let started = Instant::now();
+    let inputs = ResolvedInputs::from_options(options)?;
+    run_polish_scaffold_prepared(options, inputs, paths, started)
+}
+
+fn execute_probe_validation(
+    options: &PolishOptions,
+    mut paths: PolishPaths,
+) -> Result<(), OrgraftError> {
+    if options.validate_round <= 1 || paths.validate_round != options.validate_round {
+        return Err(OrgraftError::InvalidArgument(
+            "homorepair probes require matching validation-only round numbers".to_string(),
+        ));
+    }
+    paths.plots_enabled = false;
+    run_polish_scaffold_at_paths(options, paths)
+}
+
+fn run_polish_scaffold_prepared(
+    options: &PolishOptions,
+    inputs: ResolvedInputs,
+    paths: PolishPaths,
+    started: Instant,
+) -> Result<(), OrgraftError> {
     if paths.round_dir.exists() {
         if options.force {
             fs::remove_dir_all(&paths.round_dir)?;
@@ -313,7 +356,13 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
     let snv_indel_seconds = snv_indel_started.elapsed().as_secs_f64();
 
     let plot_started = Instant::now();
-    let plot_stage = if options.per_read_variant_calls {
+    let plot_stage = if !paths.plots_enabled {
+        Some(StageRecord::skipped(
+            "plot",
+            validation_round.clone(),
+            "internal homorepair probe: plot scripts and figures disabled",
+        ))
+    } else if options.per_read_variant_calls {
         run_plot_script(
             options,
             &inputs,
@@ -347,7 +396,11 @@ fn run_polish_scaffold(options: &PolishOptions) -> Result<(), OrgraftError> {
             "snv-indel-eval",
             validation_round.clone(),
             snv_indel_seconds,
-            "per-read SNP/InDel calls written",
+            if paths.plots_enabled {
+                "per-read SNP/InDel calls written"
+            } else {
+                "SNP/InDel evidence computed; internal probe diagnostic tables omitted"
+            },
         ));
         if let Some(record) = plot_stage {
             stage_records.push(record);
@@ -699,6 +752,7 @@ impl ResolvedInputs {
 #[derive(Debug, Clone)]
 struct PolishPaths {
     validate_round: usize,
+    plots_enabled: bool,
     subgraph_dir: PathBuf,
     round_dir: PathBuf,
     inputs_dir: PathBuf,
@@ -743,6 +797,12 @@ impl PolishPaths {
     fn new(out_dir: &Path, organelle: &str, subgraph: &str, validate_round: usize) -> Self {
         let subgraph_dir = out_dir.join(organelle).join(subgraph);
         let round_dir = subgraph_dir.join(format!("round_{validate_round}"));
+        Self::at_round_dir(out_dir, organelle, subgraph, validate_round, round_dir)
+    }
+
+    fn at_round_dir(out_dir: &Path, organelle: &str, subgraph: &str,
+        validate_round: usize, round_dir: PathBuf) -> Self {
+        let subgraph_dir = out_dir.join(organelle).join(subgraph);
         let inputs_dir = round_dir.join("01.inputs");
         let polish_dir = round_dir.join("02.polish");
         let eval_dir = round_dir.join("03.validate");
@@ -766,6 +826,7 @@ impl PolishPaths {
         let logs_dir = round_dir.join("logs");
         Self {
             validate_round,
+            plots_enabled: true,
             round_dir,
             report: logs_dir.join("report.tsv"),
             external_stderr: logs_dir.join("external.stderr.log"),
@@ -825,11 +886,13 @@ impl PolishPaths {
             &self.round1_snv_indel_dir,
             &self.round1_snv_indel_data_dir,
             &self.round1_snv_indel_reports_dir,
-            &self.round1_snv_indel_plots_dir,
-            &self.round1_sv_plots_dir,
             &self.logs_dir,
         ] {
             fs::create_dir_all(path)?;
+        }
+        if self.plots_enabled {
+            fs::create_dir_all(&self.round1_snv_indel_plots_dir)?;
+            fs::create_dir_all(&self.round1_sv_plots_dir)?;
         }
         Ok(())
     }
@@ -1678,6 +1741,7 @@ fn run_snv_indel_eval_round1(
         &paths.round1_snv_indel_per_variant_calls,
         &segments,
         &results,
+        paths.plots_enabled,
     )?;
     write_timings.per_variant_calls_seconds = per_variant_timing.total_seconds;
     write_timings.per_variant_calls_bytes = per_variant_timing.bytes;
@@ -1731,6 +1795,7 @@ fn run_snv_indel_eval_round1(
         &paths.round1_sv_coverage,
         &segments,
         &results,
+        paths.plots_enabled,
     )?;
     let write_started = Instant::now();
     append_snv_failed_segments_to_log(
@@ -2825,7 +2890,12 @@ fn write_per_variant_calls(
     path: &Path,
     segments: &[VariantSegment],
     results: &[SegmentCallResult],
+    diagnostic_tables_enabled: bool,
 ) -> Result<TsvWriteTiming, OrgraftError> {
+    // Internal probes retain the in-memory calls and native aggregate evidence.
+    if !diagnostic_tables_enabled {
+        return Ok(TsvWriteTiming::default());
+    }
     let build_started = Instant::now();
     let result_by_segment = result_by_segment_id(results);
     let total_calls = results
@@ -2952,6 +3022,7 @@ fn write_variant_type_annotation_tables(
     coverage_path: &Path,
     segments: &[VariantSegment],
     results: &[SegmentCallResult],
+    diagnostic_tables_enabled: bool,
 ) -> Result<VariantTypeAnnotationTimings, OrgraftError> {
     let total_started = Instant::now();
     let mut timings = VariantTypeAnnotationTimings::default();
@@ -2970,14 +3041,16 @@ fn write_variant_type_annotation_tables(
     timings.collect_source_rows_seconds = started.elapsed().as_secs_f64();
     timings.source_rows = source_rows.len();
 
-    let raw_timing = write_raw_variant_type_annotations(
-        raw_path,
-        &source_rows,
-        &frequency_depth,
-        &compatible_type_by_pos,
-    )?;
-    timings.write_raw_seconds = raw_timing.total_seconds;
-    timings.write_raw_bytes = raw_timing.bytes;
+    if diagnostic_tables_enabled {
+        let raw_timing = write_raw_variant_type_annotations(
+            raw_path,
+            &source_rows,
+            &frequency_depth,
+            &compatible_type_by_pos,
+        )?;
+        timings.write_raw_seconds = raw_timing.total_seconds;
+        timings.write_raw_bytes = raw_timing.bytes;
+    }
 
     let started = Instant::now();
     let combined_rows = combined_variant_type_annotation_rows(
@@ -3002,9 +3075,11 @@ fn write_variant_type_annotation_tables(
     timings.write_combined_high_seconds = combined_high_timing.total_seconds;
     timings.write_combined_high_bytes = combined_high_timing.bytes;
 
-    let plot_points_timing = write_snv_indel_plot_points(plot_points_path, combined_rows.iter())?;
-    timings.write_plot_points_seconds = plot_points_timing.total_seconds;
-    timings.write_plot_points_bytes = plot_points_timing.bytes;
+    if diagnostic_tables_enabled {
+        let plot_points_timing = write_snv_indel_plot_points(plot_points_path, combined_rows.iter())?;
+        timings.write_plot_points_seconds = plot_points_timing.total_seconds;
+        timings.write_plot_points_bytes = plot_points_timing.bytes;
+    }
 
     let started = Instant::now();
     append_snv_indel_summary(summary_path, runtime_summary)?;
@@ -4744,6 +4819,9 @@ fn run_plot_script(
     snv_indel_report: Option<&SnvIndelReport>,
     commands: &mut Vec<CommandRecord>,
 ) -> Result<(), OrgraftError> {
+    if !paths.plots_enabled {
+        return Ok(());
+    }
     let soft_paths = read_soft_paths(&inputs.soft_paths)?;
     let python = soft_paths
         .get("python")
@@ -5962,6 +6040,9 @@ fn high_subgroup_judgement(
 }
 
 fn write_plot_script(paths: &PolishPaths) -> Result<(), OrgraftError> {
+    if !paths.plots_enabled {
+        return Ok(());
+    }
     let mut file = File::create(&paths.round1_plot_script)?;
     file.write_all(PLOT_SV_SUPPORT_PY.as_bytes())?;
     let mut file = File::create(&paths.round1_sv_bubble_plot_script)?;
@@ -7556,7 +7637,18 @@ fn write_report(
         "snv_indel_overlap_policy",
         options.snv_indel_overlap_policy.as_str(),
     )?;
-    write_report_row(&mut file, "global", "run", "plot_attempted", "true")?;
+    write_report_row(
+        &mut file,
+        "global",
+        "run",
+        "plot_attempted",
+        if paths.plots_enabled { "true" } else { "false" },
+    )?;
+    if !paths.plots_enabled {
+        write_report_row(
+            &mut file, "global", "run", "snv_indel_diagnostic_tables", "omitted_internal_probe",
+        )?;
+    }
     if let Some(range) = &options.plot_range {
         write_report_row(&mut file, "global", "run", "plot_range", &range.as_arg())?;
     }
@@ -7811,20 +7903,22 @@ fn write_report(
         "path",
         &display_path(&paths.round1_sv_high_subgroup_report),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "sv_plot_script_round_1",
-        "path",
-        &display_path(&paths.round1_plot_script),
-    )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "sv_bubble_plot_script_round_1",
-        "path",
-        &display_path(&paths.round1_sv_bubble_plot_script),
-    )?;
+    if paths.plots_enabled {
+        write_report_row(
+            &mut file,
+            "output",
+            "sv_plot_script_round_1",
+            "path",
+            &display_path(&paths.round1_plot_script),
+        )?;
+        write_report_row(
+            &mut file,
+            "output",
+            "sv_bubble_plot_script_round_1",
+            "path",
+            &display_path(&paths.round1_sv_bubble_plot_script),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7832,13 +7926,15 @@ fn write_report(
         "dir",
         &display_path(&paths.round1_sv_data_dir),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "round_1_plots",
-        "dir",
-        &display_path(&paths.round1_sv_plots_dir),
-    )?;
+    if paths.plots_enabled {
+        write_report_row(
+            &mut file,
+            "output",
+            "round_1_plots",
+            "dir",
+            &display_path(&paths.round1_sv_plots_dir),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7846,13 +7942,15 @@ fn write_report(
         "dir",
         &display_path(&paths.round1_sv_reports_dir),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "snv_indel_calls_round_1",
-        "path",
-        &display_path(&paths.round1_snv_indel_per_variant_calls),
-    )?;
+    if paths.plots_enabled {
+        write_report_row(
+            &mut file,
+            "output",
+            "snv_indel_calls_round_1",
+            "path",
+            &display_path(&paths.round1_snv_indel_per_variant_calls),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7860,13 +7958,15 @@ fn write_report(
         "path",
         &display_path(&paths.round1_snv_indel_segments),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "snv_indel_variants_round_1",
-        "path",
-        &display_path(&paths.round1_snv_indel_variant_type_annotations),
-    )?;
+    if paths.plots_enabled {
+        write_report_row(
+            &mut file,
+            "output",
+            "snv_indel_variants_round_1",
+            "path",
+            &display_path(&paths.round1_snv_indel_variant_type_annotations),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7881,20 +7981,22 @@ fn write_report(
         "path",
         &display_path(&paths.round1_snv_indel_variant_type_annotations_combined_high),
     )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "snv_indel_plot_points_round_1",
-        "path",
-        &display_path(&paths.round1_snv_indel_plot_points),
-    )?;
-    write_report_row(
-        &mut file,
-        "output",
-        "snv_indel_plot_script_round_1",
-        "path",
-        &display_path(&paths.round1_snv_indel_plot_script),
-    )?;
+    if paths.plots_enabled {
+        write_report_row(
+            &mut file,
+            "output",
+            "snv_indel_plot_points_round_1",
+            "path",
+            &display_path(&paths.round1_snv_indel_plot_points),
+        )?;
+        write_report_row(
+            &mut file,
+            "output",
+            "snv_indel_plot_script_round_1",
+            "path",
+            &display_path(&paths.round1_snv_indel_plot_script),
+        )?;
+    }
     write_report_row(
         &mut file,
         "output",
@@ -7979,10 +8081,10 @@ fn write_report(
         write_alignment_report_rows(&mut file, alignment_report)?;
     }
     if let Some(report) = sv_eval_report {
-        write_sv_eval_report_rows(&mut file, report)?;
+        write_sv_eval_report_rows(&mut file, report, paths.plots_enabled)?;
     }
     if let Some(report) = snv_indel_report {
-        write_snv_indel_report_rows(&mut file, report)?;
+        write_snv_indel_report_rows(&mut file, report, paths.plots_enabled)?;
     }
     for record in command_records {
         let name = format!("{}:{}", record.stage, record.round);
@@ -8008,7 +8110,11 @@ fn write_report(
     Ok(())
 }
 
-fn write_sv_eval_report_rows(file: &mut File, report: &SvEvalReport) -> Result<(), OrgraftError> {
+fn write_sv_eval_report_rows(
+    file: &mut File,
+    report: &SvEvalReport,
+    plots_enabled: bool,
+) -> Result<(), OrgraftError> {
     let name = "round_1";
     write_report_row(
         file,
@@ -8253,13 +8359,15 @@ fn write_sv_eval_report_rows(file: &mut File, report: &SvEvalReport) -> Result<(
         "high_subgroup_report_path",
         &display_path(&report.high_subgroup_report_path),
     )?;
-    write_report_row(
-        file,
-        "sv_eval",
-        name,
-        "plot_script_path",
-        &display_path(&report.plot_script_path),
-    )?;
+    if plots_enabled {
+        write_report_row(
+            file,
+            "sv_eval",
+            name,
+            "plot_script_path",
+            &display_path(&report.plot_script_path),
+        )?;
+    }
     write_report_row(
         file,
         "sv_eval",
@@ -8294,6 +8402,7 @@ fn write_sv_eval_report_rows(file: &mut File, report: &SvEvalReport) -> Result<(
 fn write_snv_indel_report_rows(
     file: &mut File,
     report: &SnvIndelReport,
+    diagnostic_tables_enabled: bool,
 ) -> Result<(), OrgraftError> {
     let name = "round_1";
     write_report_row(file, "snv_indel", name, "call_mode", report.call_mode)?;
@@ -8391,13 +8500,15 @@ fn write_snv_indel_report_rows(
         "reference_path",
         &display_path(&report.reference_path),
     )?;
-    write_report_row(
-        file,
-        "snv_indel",
-        name,
-        "per_variant_calls_path",
-        &display_path(&report.per_variant_calls_path),
-    )?;
+    if diagnostic_tables_enabled {
+        write_report_row(
+            file,
+            "snv_indel",
+            name,
+            "per_variant_calls_path",
+            &display_path(&report.per_variant_calls_path),
+        )?;
+    }
     write_report_row(
         file,
         "snv_indel",
@@ -8405,13 +8516,15 @@ fn write_snv_indel_report_rows(
         "segments_path",
         &display_path(&report.segments_path),
     )?;
-    write_report_row(
-        file,
-        "snv_indel",
-        name,
-        "variants_path",
-        &display_path(&report.variant_type_annotations_path),
-    )?;
+    if diagnostic_tables_enabled {
+        write_report_row(
+            file,
+            "snv_indel",
+            name,
+            "variants_path",
+            &display_path(&report.variant_type_annotations_path),
+        )?;
+    }
     write_report_row(
         file,
         "snv_indel",
@@ -8426,20 +8539,22 @@ fn write_snv_indel_report_rows(
         "high_variants_path",
         &display_path(&report.variant_type_annotations_combined_high_path),
     )?;
-    write_report_row(
-        file,
-        "snv_indel",
-        name,
-        "plot_points_path",
-        &display_path(&report.plot_points_path),
-    )?;
-    write_report_row(
-        file,
-        "snv_indel",
-        name,
-        "plot_script_path",
-        &display_path(&report.plot_script_path),
-    )?;
+    if diagnostic_tables_enabled {
+        write_report_row(
+            file,
+            "snv_indel",
+            name,
+            "plot_points_path",
+            &display_path(&report.plot_points_path),
+        )?;
+        write_report_row(
+            file,
+            "snv_indel",
+            name,
+            "plot_script_path",
+            &display_path(&report.plot_script_path),
+        )?;
+    }
     write_report_row(
         file,
         "snv_indel",
@@ -10042,4 +10157,271 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn homorepair_path_adapter_preserves_native_round_layout() {
+        let out = Path::new("results/polish");
+        let native = PolishPaths::new(out, "plastid", "subgraph_001", 3);
+        let explicit = PolishPaths::at_round_dir(out, "plastid", "subgraph_001", 3,
+            out.join("plastid/subgraph_001/round_3"));
+        assert_eq!(native.input_draft, explicit.input_draft);
+        assert_eq!(native.round1_snv_indel_per_variant_calls, explicit.round1_snv_indel_per_variant_calls);
+        assert_eq!(native.report, explicit.report);
+
+    }
+
+    #[test]
+    fn homorepair_native_scaffold_adapter_runs_validation_only_layout() {
+        let dir = temp_file_path("homorepair_native_scaffold", "dir");
+        fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("corrected.fasta");
+        let reference = dir.join("reference.fasta");
+        let reads = dir.join("reads.fasta");
+        let soft_paths = dir.join("soft_paths.txt");
+        fs::write(&draft, ">subgraph_001\nACGTT\n").unwrap();
+        fs::write(&reference, ">subgraph_001\nACGT\n").unwrap();
+        fs::write(&reads, ">read1\nACGTT\n").unwrap();
+        fs::write(&soft_paths, "").unwrap();
+        let args = vec!["--organelle".into(), "plastid".into(), "--subgraph".into(), "subgraph_001".into(),
+            "--draft".into(), draft.display().to_string(), "--reference".into(), reference.display().to_string(),
+            "--reads".into(), reads.display().to_string(), "--soft-paths".into(), soft_paths.display().to_string(),
+            "--out-dir".into(), dir.display().to_string(), "--validate-round".into(), "3".into(),
+            "--per-read-variant-calls".into(), "off".into()];
+        let options = PolishOptions::from_args(&args).unwrap();
+        let round_dir = dir.join("plastid/subgraph_001/round_3");
+        let paths = PolishPaths::at_round_dir(&dir, "plastid", "subgraph_001", 3, round_dir.clone());
+        let input_draft = paths.input_draft.clone();
+        let report = paths.report.clone();
+        run_polish_scaffold_at_paths(&options, paths).unwrap();
+        assert_eq!(fs::read_to_string(input_draft).unwrap(), fs::read_to_string(&draft).unwrap());
+        let report = fs::read_to_string(report).unwrap();
+        assert!(report.contains("validation-only workflow round; using corrected checkpoint FASTA directly"));
+        assert!(report.contains("round_3"));
+        assert!(!round_dir.join("02.polish/polished_aln.fasta").exists());
+        assert!(!dir.join("plastid/subgraph_001/homorepair").exists());
+        assert!(round_dir.join("03.validate/02.plots").is_dir());
+
+        let probe_dir = dir.join("plastid/subgraph_001/round_hr/probe_1");
+        let probe_paths = PolishPaths::at_round_dir(
+            &dir, "plastid", "subgraph_001", 3, probe_dir.clone(),
+        );
+        let probe_report = probe_paths.report.clone();
+        execute_probe_validation(&options, probe_paths).unwrap();
+        let probe_report = fs::read_to_string(probe_report).unwrap();
+        assert!(probe_report.contains("global\trun\tplot_attempted\tfalse"));
+        assert!(probe_report.contains("internal homorepair probe: plot scripts and figures disabled"));
+        assert!(!probe_dir.join("03.validate/02.plots").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn homorepair_probe_preserves_sv_evidence_without_plot_artifacts() {
+        let dir = temp_file_path("homorepair_probe_plots", "dir");
+        let options = PolishOptions::from_args(&[
+            "--organelle".into(), "mito".into(), "--reads".into(), "reads.fasta".into(),
+        ]).unwrap();
+        let normal = PolishPaths::at_round_dir(
+            &dir, "mito", "subgraph_001", 2, dir.join("normal"),
+        );
+        let mut probe = PolishPaths::at_round_dir(
+            &dir, "mito", "subgraph_001", 2, dir.join("probe"),
+        );
+        probe.plots_enabled = false;
+        normal.create_dirs().unwrap();
+        probe.create_dirs().unwrap();
+        let mut records = Vec::new();
+        let mut paf_by_read = HashMap::new();
+        for i in 1..=3 {
+            let read_id = format!("read{i}");
+            let summary = format!("{read_id}\tmito\t1000\taln_type=1;NA\t100.0\taln=1;len=1000;olp=NA;idt=100.0;strand=+;qs=1;qe=1000;ss=1;se=1000;cn=1;c1=100.0,1,1");
+            records.push(parse_alignment_summary_record(&summary, i).unwrap());
+            let paf = format!("{read_id}\t1000\t0\t1000\t+\tmito\t1000\t0\t1000\t1000\t1000\t60\ttp:A:P\tcg:Z:1000M");
+            paf_by_read.insert(read_id, vec![parse_paf_alignment(&paf).unwrap().unwrap()]);
+        }
+        let normal_report = write_read_group_reports(
+            &records, &normal, 1000, &options, &paf_by_read,
+        ).unwrap();
+        let probe_report = write_read_group_reports(
+            &records, &probe, 1000, &options, &paf_by_read,
+        ).unwrap();
+        assert_eq!(normal_report.sv_support_status, "pass");
+        assert_eq!(probe_report.sv_support_status, normal_report.sv_support_status);
+        // Feed identical caller results into the ordinary and internal writers.
+        // The caller-result fixture has a high-frequency SNV and a lower-frequency indel.
+        let read_sequences = (1..=3)
+            .map(|i| (format!("read{i}"), "A".repeat(1000)))
+            .collect::<HashMap<_, _>>();
+        let segments = build_variant_segments(
+            &records, &read_index_from_alignment_records(&records), &read_sequences,
+            options.snv_indel_overlap_policy,
+        ).unwrap();
+        assert_eq!(segments.len(), 3);
+        let results = segments.iter().map(|segment| SegmentCallResult {
+            segment: segment.clone(),
+            calls: vec![if segment.read_id == "read3" {
+                VariantCall::high(600, "A".into(), "AC".into())
+            } else {
+                VariantCall::high(500, "A".into(), "C".into())
+            }],
+            elapsed_seconds: 0.0,
+            exit_status: 0,
+            message: "ok".into(),
+            stderr: String::new(),
+        }).collect::<Vec<_>>();
+        let runtime = SnvIndelRuntimeSummary {
+            fl_read_count: 3, segment_count: 3, total_calls: 3, reads_with_calls: 3,
+            failed_segments: 0, workers: 1, elapsed_seconds: 0.0,
+            shared_minimap2_stream_seconds: 0.0, split_sam_records: 3,
+            sum_segment_seconds: 0.0, reference_path: "fixture.fasta".into(),
+            call_mode: "rust", overlap_policy: options.snv_indel_overlap_policy.as_str(),
+            sv_context_filter: true, minimap2_preset: "map-hifi",
+        };
+        let inputs = ResolvedInputs {
+            draft: dir.join("fixture.fasta"), reference: dir.join("fixture.fasta"),
+            reads: dir.join("reads.fasta"), soft_paths: dir.join("soft_paths.txt"),
+        };
+        let record = FastaRecordInfo { id: "mito".into(), header: "mito".into() };
+        for paths in [&normal, &probe] {
+            let mut evidence = File::create(&paths.round1_sv_whole_read_evidence).unwrap();
+            write_whole_read_evidence_header(&mut evidence).unwrap();
+            for i in 1..=3 {
+                let read = ReadRecord { id: format!("read{i}"), sequence: "A".repeat(1000) };
+                write_whole_read_evidence_rows(
+                    &mut evidence, &read, &paf_by_read[&read.id], None,
+                ).unwrap();
+            }
+            fs::write(paths.validation_fasta(), format!(">mito\n{}\n", "A".repeat(1000))).unwrap();
+            let per_variant = write_per_variant_calls(
+                &paths.round1_snv_indel_per_variant_calls, &segments, &results, paths.plots_enabled,
+            ).unwrap();
+            let segment_timing = write_variant_segments_tsv(
+                &paths.round1_snv_indel_segments, &segments, &results,
+            ).unwrap();
+            let variant_type = write_variant_type_annotation_tables(
+                &paths.round1_snv_indel_variant_type_annotations,
+                &paths.round1_snv_indel_variant_type_annotations_combined,
+                &paths.round1_snv_indel_variant_type_annotations_combined_high,
+                &paths.round1_snv_indel_plot_points, &paths.round1_sv_support_summary,
+                &runtime, paths.validation_fasta(), &paths.round1_sv_coverage,
+                &segments, &results, paths.plots_enabled,
+            ).unwrap();
+            if paths.plots_enabled {
+                assert!(per_variant.bytes > 0);
+                assert!(variant_type.write_raw_bytes > 0);
+                assert!(variant_type.write_plot_points_bytes > 0);
+            } else {
+                assert_eq!(per_variant.bytes, 0);
+                assert_eq!(variant_type.write_raw_bytes, 0);
+                assert_eq!(variant_type.write_plot_points_bytes, 0);
+            }
+            let report = SnvIndelReport {
+                fl_read_count: 3, segment_count: 3, total_calls: 3, reads_with_calls: 3,
+                failed_segments: 0, worker_count: 1, elapsed_seconds: 0.0,
+                alignment_seconds: 0.0, sum_segment_seconds: 0.0,
+                per_variant_calls_path: paths.round1_snv_indel_per_variant_calls.clone(),
+                segments_path: paths.round1_snv_indel_segments.clone(),
+                variant_type_annotations_path: paths.round1_snv_indel_variant_type_annotations.clone(),
+                variant_type_annotations_combined_path: paths.round1_snv_indel_variant_type_annotations_combined.clone(),
+                variant_type_annotations_combined_high_path: paths.round1_snv_indel_variant_type_annotations_combined_high.clone(),
+                plot_points_path: paths.round1_snv_indel_plot_points.clone(),
+                plot_script_path: paths.round1_snv_indel_plot_script.clone(),
+                summary_path: paths.round1_sv_support_summary.clone(),
+                reference_path: paths.validation_fasta().to_path_buf(),
+                call_mode: "rust", overlap_policy: runtime.overlap_policy,
+                sv_context_filter: true, minimap2_preset: "map-hifi",
+                write_timings: SnvIndelWriteTimings {
+                    per_variant_calls_seconds: per_variant.total_seconds,
+                    per_variant_calls_bytes: per_variant.bytes,
+                    variant_segments_seconds: segment_timing.total_seconds,
+                    variant_segments_bytes: segment_timing.bytes,
+                    variant_type,
+                    ..Default::default()
+                },
+            };
+            write_report(
+                &paths.report, &options, &inputs, paths, &record, &record,
+                &[], &[], None, None, Some(&report), &[],
+            ).unwrap();
+            let report_text = fs::read_to_string(&paths.report).unwrap();
+            for name in ["snv_indel_calls.tsv", "snv_indel_variants.tsv", "snv_indel_plot_points.tsv"] {
+                assert_eq!(report_text.contains(name), paths.plots_enabled,
+                    "report references an omitted probe table: {name}");
+                assert_eq!(paths.round1_snv_indel_data_dir.join(name).is_file(), paths.plots_enabled);
+            }
+            assert_eq!(report_text.contains("omitted_internal_probe"), !paths.plots_enabled);
+            if !paths.plots_enabled {
+                for script in [&paths.round1_plot_script, &paths.round1_sv_bubble_plot_script,
+                    &paths.round1_snv_indel_plot_script] {
+                    assert!(!report_text.contains(&display_path(script)));
+                }
+            }
+        }
+        for relative in [
+            "03.validate/01.data/snv_indel_segments.tsv",
+            "03.validate/01.data/snv_indel_variants_combined.tsv",
+            "03.validate/03.reports/snv_indel_high.tsv",
+        ] {
+            assert_eq!(fs::read(normal.round_dir.join(relative)).unwrap(),
+                fs::read(probe.round_dir.join(relative)).unwrap(), "probe changed {relative}");
+        }
+        let combined = fs::read_to_string(&probe.round1_snv_indel_variant_type_annotations_combined).unwrap();
+        let high = fs::read_to_string(&probe.round1_snv_indel_variant_type_annotations_combined_high).unwrap();
+        assert!(combined.lines().any(|line| line.starts_with("500\t")));
+        assert!(combined.lines().any(|line| line.starts_with("600\t")));
+        assert!(high.lines().any(|line| line.starts_with("500\t")));
+        assert!(!high.lines().any(|line| line.starts_with("600\t")));
+        let data_names = |paths: &PolishPaths| -> BTreeSet<_> {
+            fs::read_dir(&paths.round1_snv_indel_data_dir).unwrap()
+                .map(|entry| entry.unwrap().file_name()).collect()
+        };
+        let mut normal_data = data_names(&normal);
+        for name in ["snv_indel_calls.tsv", "snv_indel_variants.tsv", "snv_indel_plot_points.tsv"] {
+            assert!(normal_data.remove(&std::ffi::OsString::from(name)));
+        }
+        assert_eq!(normal_data, data_names(&probe));
+        for relative in [
+            "03.validate/01.data/sv_read_evidence.tsv",
+            "03.validate/01.data/sv_read_index.tsv",
+            "03.validate/01.data/sv_coverage.tsv",
+            "03.validate/03.reports/sv_group_stats.tsv",
+            "03.validate/03.reports/sv_subgroup_stats.tsv",
+            "03.validate/03.reports/sv_high_subgroups.tsv",
+            "03.validate/03.reports/sv_snv_indel_summary.tsv",
+        ] {
+            assert_eq!(
+                fs::read(normal.round_dir.join(relative)).unwrap(),
+                fs::read(probe.round_dir.join(relative)).unwrap(),
+                "probe changed validation evidence: {relative}",
+            );
+        }
+        for script in [
+            &normal.round1_plot_script,
+            &normal.round1_sv_bubble_plot_script,
+            &normal.round1_snv_indel_plot_script,
+        ] {
+            assert!(script.is_file());
+        }
+        assert!(!probe.round1_sv_plots_dir.exists());
+        let inputs = ResolvedInputs {
+            draft: dir.join("unused.fasta"),
+            reference: dir.join("unused-reference.fasta"),
+            reads: dir.join("unused-reads.fasta"),
+            soft_paths: dir.join("missing-tools.txt"),
+        };
+        let mut commands = Vec::new();
+        run_plot_script(&options, &inputs, &probe, None, None, &mut commands).unwrap();
+        assert!(commands.is_empty());
+        assert!(!probe.round1_sv_plots_dir.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disabled_homorepair_leaves_ordinary_arguments_unchanged() {
+        let ordinary: Vec<String> = ["--organelle", "plastid", "--reads", "reads.fastq.gz"]
+            .into_iter().map(String::from).collect();
+        let (parsed, review) = postrepair::parse_args(&ordinary).unwrap();
+        assert_eq!(parsed, ordinary);
+        assert!(review.is_none());
+
+    }
+
 }

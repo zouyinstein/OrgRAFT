@@ -18,8 +18,8 @@ tools.
 
 | Component | Role | Boundary |
 | --- | --- | --- |
-| OrgRAFT Rust CLI | Recruit reads, assemble draft graphs, resolve checked GFAs, polish, rebuild verified GFAs, and write evidence tables | Rust algorithm core plus delegated aligner calls |
-| Workflow layer | Parse TOML, generate scripts, manage checkpoints, and bound correction rounds | Orchestration only; core algorithms stay in subcommands |
+| OrgRAFT Rust CLI | Recruit reads, assemble draft graphs, resolve checked GFAs, polish, review residual errors, rebuild verified GFAs, refine components, and write evidence tables | Rust algorithm core plus delegated aligner calls |
+| Workflow layer | Parse TOML, generate scripts, manage checkpoints, and bound correction rounds | Orchestration and source/evidence handoff checks; sequence and graph reconstruction stay in subcommands |
 | GFA_Editor CLI | Optional reference-coloured GFA PDF/SVG export | Visualization/export layer consuming stable GFA/FASTA files |
 | External tools | `minimap2`, `blastn`, `pigz`, Python plotting helpers | Runtime dependencies recorded in `soft_paths.txt` and `requirements.txt` |
 
@@ -33,7 +33,9 @@ OrgRAFT Rust CLI
   asm         conservative graph construction or read-backed supplied-GFA repair
   resolve     checked graph orientation, conservative merge, subgraph export
   polish      polished linear sequence and variant/read-support validation
+  postrepair  source-bound review of residual sequence errors
   rebuild     final verified graph/FASTA reconstruction and compact reports
+  refine      repeat representation and multi-component connectivity
 
 GFA_Editor
   topology view
@@ -49,8 +51,13 @@ GFA_Editor
 Paths are stage-oriented and should change deliberately, because downstream
 inspection, reporting, and optional GFA_Editor export depend on them.
 Workflow-generated roots are numbered for the major products:
-`01.recruit`, `02.draft_asm`, `03.resolve_gfa`, `04.polish`, and
-`05.rebuild`; checkpoint scripts and status files live under `workflow/`.
+`01.recruit`, `02.draft_asm`, `03.resolve_gfa`, `04.polish`, `05.postrepair`,
+`06.rebuild`, and `07.refine`. The config and the direct run/manual shell entrypoints
+live at the route root; checkpoint status and bound refine inputs live under
+`workflow/`. Paths are resolved relative to the config file, not the caller's
+working directory. Old explicit output paths remain supported. A separate
+`source_results_dir` can name previous inputs; all new output paths and checkpoint
+paths must still point into the new run directory.
 
 | Stage | Core outputs | Notes |
 | --- | --- | --- |
@@ -59,8 +66,22 @@ Workflow-generated roots are numbered for the major products:
 | `workflow checkpoint1` | `checkpoint_1.status.tsv`, `checked_draft.gfa`, optional `manual_edit_required.gfa` | Topology and GFA consistency gate before resolve |
 | `resolve` | `ORGANELLE/graph/merged_unresolved.gfa`, `merged_unresolved_subgraph_001.gfa`, `ORGANELLE/fasta/rotated_reference.fasta`, `resolved_subgraphs.fasta`, `logs/resolve_details.tsv` | Uses checked draft graph plus reference FASTA |
 | `polish` | `ORGANELLE/SUBGRAPH/round_N/{01.inputs,02.polish,03.validate,logs}`; round 2+ leaves `02.polish` empty and validates `01.inputs/linear_subgraph.round_N.fasta` | Plot scripts require `matplotlib` |
-| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `sv_repair/{sv_repair.tsv,sv_candidate_scores.tsv,sv_graph_localization.tsv}`, optional `repeat_pairing_repair/repeat_pairing_mismatch.tsv`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | Prepares one correction at a time; a repeat-pairing mismatch emits `rebuild_ready` and preserves resolve output |
+| `workflow checkpoint2` | `checkpoint_2/round_N/checkpoint_2.status.tsv`, optional `sv_repair/{sv_repair.tsv,sv_candidate_scores.tsv,sv_graph_localization.tsv}`, optional `repeat_pairing_repair/repeat_pairing_mismatch.tsv`, optional `pos_ref_alt.txt`, optional `polish_aln_v{N+1}.fasta` | Prepares one correction at a time; an eligible legacy repeat-pairing correction emits `rebuild_ready`. If enabled postrepair or refine requires a recorded source, an unapplied repeat-pairing correction remains `manual_required` and the next-round script stops without scientific commands |
+| `postrepair` | `ORGANELLE/SUBGRAPH/postrepair.md`, `postrepair.tsv`, `round_hr/`, optional new validation rounds | The Markdown report links the final selected sequence and evidence. Input round stays read-only; unresolved evidence prevents the workflow handoff |
 | `rebuild` | `OUT/SUBGRAPH/rebuild_SUBGRAPH.gfa`, `rebuild_SUBGRAPH.fasta`, `rebuild_SUBGRAPH_nodes.fasta`, `OUT/logs/*.tsv` | Workflow passes reads so repeat `P` records carry complete flank-repeat-flank read counts; optional repeat constraint filters graph-valid circular candidates before writing FASTA |
+| `refine` | Assessment tables; with `--auto`, `ORGANELLE/auto_complete.tsv` and its retained component bundle | Consumes all components together; the completion record preserves confirmation or review status |
+
+The standalone `refine --rebuild-dir` entrypoint derives its bundle and per-component
+source bindings in the native rebuild directory's `logs/`; it leaves existing
+rebuild products unchanged. Both this entrypoint and the workflow require the
+full organelle read pool when components use separate split pools.
+
+Refine consumes one bundle containing every enabled component of one organelle.
+Its source contract is derived from the completed native rebuild report, original
+checked graph and resolve details, complete graph walk, final validation, reads,
+and reference. The workflow does not manufacture acceptance from a directory
+name or a previous report label. `auto_complete.tsv` names the retained bundle;
+`review_required` and `partial_requires_review` remain review outcomes.
 
 ## Repeat-Pairing Constraint
 

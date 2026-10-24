@@ -18,7 +18,9 @@ const HELP: &str = concat!(
     " -- High-quality graph generation\n",
     "    resolve     resolve checked draft GFA into reference-oriented graph products\n",
     "    polish      polish linearized graph FASTA and evaluate variants\n",
-    "    rebuild     rebuild final verified graph and compact reports\n\n",
+    "    postrepair  review residual repeat, InDel, and circular-origin errors\n",
+    "    rebuild     rebuild final verified graph and compact reports\n",
+    "    refine      Refine repeat representation and component connectivity.\n\n",
     " Workflow runs are configured through orgraft.workflow.toml.\n"
 );
 
@@ -50,7 +52,9 @@ where
         "asm" => commands::asm::run(&rest),
         "resolve" => commands::resolve::run(&rest),
         "polish" => commands::polish::run(&rest),
+        "postrepair" => commands::postrepair::run(&rest),
         "rebuild" => commands::rebuild::run(&rest),
+        "refine" | "repeat-reclassify" => commands::refine::run(&rest),
         "setup" => commands::setup::run(&rest),
         _ => Err(OrgraftError::UnknownSubcommand(command)),
     }
@@ -90,7 +94,7 @@ mod tests {
 
     #[test]
     fn high_quality_graph_commands_succeed() {
-        for command in ["resolve", "polish", "rebuild", "workflow"] {
+        for command in ["resolve", "polish", "postrepair", "rebuild", "refine", "workflow"] {
             let args = vec!["orgraft".to_string(), command.to_string()];
             assert!(run(args).is_ok());
         }

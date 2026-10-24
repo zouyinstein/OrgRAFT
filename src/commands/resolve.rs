@@ -30,6 +30,7 @@ Outputs:
 
 Additional Parameters:
   --gfa-editor-mode MODE         rust|cli repeat candidate selection engine [rust]
+  --oatk-closing-overlap         trim a verified circular closing overlap for Oatk graphs
   --max-states N                 auto-repeat search state limit [5000]
   --max-candidates N             auto-repeat final candidate limit [100]
 
@@ -104,6 +105,7 @@ fn run_resolve(options: &ResolveOptions) -> Result<(), OrgraftError> {
         options.max_candidates,
         options.gfa_editor_mode,
         gfa_editor_cli.as_deref(),
+        options.oatk_closing_overlap,
     )?;
     let alignment = align_fasta_to_reference_coordinates(
         &reference_state.rotated_fasta,
@@ -155,6 +157,7 @@ fn contract() -> CommandContract {
             "--checked-draft-gfa FILE",
             "--reference FILE for automatic reference rotation, or --pre-rotated-reference FILE to skip internal rotation",
             "--organelle NAME optional output subdirectory name; no algorithm effect",
+            "--oatk-closing-overlap opt-in for Oatk source graphs; verify and trim a selected circle's closing overlap",
             "soft_paths.txt containing blastn and optional gfa_editor_cli",
         ],
         outputs: &[
@@ -182,6 +185,7 @@ struct ResolveOptions {
     organelle: Option<String>,
     force: bool,
     gfa_editor_mode: GfaEditorMode,
+    oatk_closing_overlap: bool,
     max_states: usize,
     max_candidates: usize,
 }
@@ -268,6 +272,7 @@ impl ResolveOptions {
         let mut organelle: Option<String> = None;
         let mut force = false;
         let mut gfa_editor_mode = GfaEditorMode::Rust;
+        let mut oatk_closing_overlap = false;
         let mut max_states = DEFAULT_AUTO_REPEAT_MAX_STATES;
         let mut max_candidates = DEFAULT_AUTO_REPEAT_MAX_CANDIDATES;
 
@@ -306,6 +311,9 @@ impl ResolveOptions {
                 "--no-gfa-editor-cli" => {
                     gfa_editor_mode = GfaEditorMode::Rust;
                 }
+                "--oatk-closing-overlap" => {
+                    oatk_closing_overlap = true;
+                }
                 "--max-states" => {
                     max_states = parse_usize(required_value(args, &mut index, arg)?, arg)?;
                 }
@@ -342,6 +350,11 @@ impl ResolveOptions {
         if let Some(label) = &organelle {
             out_dir = out_dir.join(label);
         }
+        if oatk_closing_overlap && matches!(gfa_editor_mode, GfaEditorMode::Cli) {
+            return Err(OrgraftError::InvalidArgument(
+                "--oatk-closing-overlap requires --gfa-editor-mode rust".to_string(),
+            ));
+        }
         Ok(Self {
             checked_draft_gfa,
             reference,
@@ -350,6 +363,7 @@ impl ResolveOptions {
             organelle,
             force,
             gfa_editor_mode,
+            oatk_closing_overlap,
             max_states: max_states.max(1),
             max_candidates: max_candidates.max(1),
         })
@@ -1504,7 +1518,12 @@ fn convert_link(
 ) -> Option<Link> {
     let merged_from = old_to_new.get(&link.from_name)?;
     let merged_to = old_to_new.get(&link.to_name)?;
-    if merged_from == merged_to {
+    let preserved_self_link = link.from_name == link.to_name
+        && old_to_info
+            .get(&link.from_name)
+            .is_some_and(|info| info.path.len() == 1);
+    // A checked self-link is source evidence, not an absorbed edge inside a compacted path.
+    if merged_from == merged_to && !preserved_self_link {
         return None;
     }
     let from_endpoint = old_from_endpoint(link.from_orient);
@@ -1618,6 +1637,8 @@ struct SubgraphResolution {
     candidate_count: usize,
     selected_candidate: String,
     selected_circular: bool,
+    closing_overlap_trimmed_bp: usize,
+    internal_overlap_mismatch_bp: usize,
     selected_order: Vec<String>,
     score_method: String,
     score_value: Option<f64>,
@@ -1675,6 +1696,8 @@ pub(crate) struct RepeatPathConstraintResult {
     pub selection_method: String,
     pub score: Option<f64>,
     pub continuous_fraction: Option<f64>,
+    pub selected_order: String,
+    pub search_complete: bool,
     pub ordered_nodes: Vec<String>,
     pub oriented_nodes: Vec<String>,
     pub boundary_offsets: Vec<usize>,
@@ -1694,6 +1717,8 @@ struct MergedSequence {
     ordered_nodes: Vec<String>,
     oriented_nodes: Vec<String>,
     boundary_offsets: Vec<usize>,
+    closing_overlap_trimmed_bp: usize,
+    internal_overlap_mismatch_bp: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2075,7 +2100,7 @@ pub(crate) fn select_repeat_path_constrained_candidate(
         )
     } else {
         let references = build_reference_indexes(&read_fasta(request.reference_fasta)?);
-        let scores = score_candidates_against_references(&matching, &references)?;
+        let scores = score_candidates_against_references(&matching, &references, false)?;
         let best = best_candidate_score(&scores).ok_or_else(|| {
             OrgraftError::InvalidArgument(
                 "global k-mer chain produced no score for repeat-constrained candidates"
@@ -2106,7 +2131,7 @@ pub(crate) fn select_repeat_path_constrained_candidate(
     };
     let score_by_candidate = if matching.len() > 1 {
         let references = build_reference_indexes(&read_fasta(request.reference_fasta)?);
-        score_candidates_against_references(&matching, &references)?
+        score_candidates_against_references(&matching, &references, false)?
             .into_iter()
             .map(|score| (score.candidate_id.clone(), score))
             .collect::<HashMap<_, _>>()
@@ -2133,6 +2158,8 @@ pub(crate) fn select_repeat_path_constrained_candidate(
     let merged = merge_graph_to_sequence(&selected.graph)?;
     Ok(RepeatPathConstraintResult {
         sequence: merged.sequence,
+        search_complete: warning.is_none(),
+        selected_order: selected.order.iter().map(|s| format!("{}:{}->{}", s.node_id, s.strategy, s.duplicate_id)).collect::<Vec<_>>().join(","),
         selected_candidate: selected.id.clone(),
         candidate_count: candidates.len(),
         filtered_candidate_count: matching.len(),
@@ -2916,7 +2943,7 @@ fn head_to_tail_sequence_feature(sequence: &str) -> String {
     )
 }
 
-fn sha256_hex(input: &[u8]) -> String {
+pub(crate) fn sha256_hex(input: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -3035,6 +3062,8 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
             ordered_nodes: vec![segment.name.clone()],
             oriented_nodes: vec![format!("{}+", segment.name)],
             boundary_offsets: vec![0],
+            closing_overlap_trimmed_bp: 0,
+            internal_overlap_mismatch_bp: 0,
         });
     }
 
@@ -3069,7 +3098,185 @@ fn merge_graph_to_sequence(graph: &GfaGraph) -> Result<MergedSequence, OrgraftEr
         ordered_nodes: order,
         oriented_nodes,
         boundary_offsets,
+        closing_overlap_trimmed_bp: 0,
+        internal_overlap_mismatch_bp: 0,
     })
+}
+
+fn oatk_oriented_sequence(graph: &GfaGraph, node: &str, orient: char) -> Result<String, OrgraftError> {
+    let sequence = &graph
+        .segments
+        .get(node)
+        .ok_or_else(|| OrgraftError::InvalidArgument(format!("missing node `{node}`")))?
+        .sequence;
+    match orient {
+        '+' => Ok(sequence.clone()),
+        '-' => Ok(reverse_complement(sequence)),
+        _ => Err(OrgraftError::InvalidArgument(format!(
+            "invalid orientation `{orient}` for node `{node}`"
+        ))),
+    }
+}
+
+fn oatk_oriented_overlap(
+    graph: &GfaGraph,
+    left: &str,
+    left_orient: char,
+    right: &str,
+    right_orient: char,
+    require_identical_bases: bool,
+) -> Result<(usize, usize), OrgraftError> {
+    let reverse = |orient| if orient == '+' { '-' } else { '+' };
+    let links = graph
+        .links
+        .iter()
+        .filter(|link| {
+            (link.from_name == left
+                && link.from_orient == left_orient
+                && link.to_name == right
+                && link.to_orient == right_orient)
+                || (link.from_name == right
+                    && link.from_orient == reverse(right_orient)
+                    && link.to_name == left
+                    && link.to_orient == reverse(left_orient))
+        })
+        .collect::<Vec<_>>();
+    if links.len() != 1 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "Oatk selected path has {} oriented links from `{left}{left_orient}` to `{right}{right_orient}`; expected one",
+            links.len()
+        )));
+    }
+    let cigar = &links[0].overlap;
+    let overlap = cigar
+        .strip_suffix('M')
+        .filter(|value| !value.is_empty() && value.bytes().all(|ch| ch.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| OrgraftError::InvalidArgument(format!(
+            "Oatk oriented overlap must be one exact nM CIGAR, got `{cigar}`"
+        )))?;
+    let left_sequence = oatk_oriented_sequence(graph, left, left_orient)?;
+    let right_sequence = oatk_oriented_sequence(graph, right, right_orient)?;
+    if overlap > left_sequence.len() || overlap > right_sequence.len() {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "Oatk oriented overlap from `{left}{left_orient}` to `{right}{right_orient}` exceeds a node length"
+        )));
+    }
+    let mismatches = left_sequence.as_bytes()[left_sequence.len() - overlap..]
+        .iter()
+        .zip(&right_sequence.as_bytes()[..overlap])
+        .filter(|(a, b)| a != b)
+        .count();
+    if require_identical_bases && mismatches != 0 {
+        return Err(OrgraftError::InvalidArgument(format!(
+            "Oatk oriented overlap from `{left}{left_orient}` to `{right}{right_orient}` does not exactly match"
+        )));
+    }
+    Ok((overlap, mismatches))
+}
+
+fn maybe_trim_oatk_closing_overlap(
+    graph: &GfaGraph,
+    mut merged: MergedSequence,
+    enabled: bool,
+) -> Result<MergedSequence, OrgraftError> {
+    if !enabled || !graph_is_circular_subgraph(graph) {
+        return Ok(merged);
+    }
+    if merged.ordered_nodes.len() < 2 {
+        return Err(OrgraftError::InvalidArgument(
+            "Oatk circular closing overlap needs a recorded multi-node path".to_string(),
+        ));
+    }
+    // The legacy merger looks up an internal overlap by unordered node names.
+    // Re-spell an opted-in Oatk circle from its selected oriented links so a
+    // two-node closing edge cannot be mistaken for the internal edge.
+    let mut sequence = String::new();
+    let mut boundary_offsets = Vec::with_capacity(merged.ordered_nodes.len());
+    let mut internal_mismatches = 0usize;
+    for (index, node) in merged.ordered_nodes.iter().enumerate() {
+        let orient = merged.oriented_nodes[index].chars().last().unwrap();
+        let part = oatk_oriented_sequence(graph, node, orient)?;
+        if index == 0 {
+            boundary_offsets.push(0);
+            sequence.push_str(&part);
+        } else {
+            let previous = &merged.ordered_nodes[index - 1];
+            let previous_orient = merged.oriented_nodes[index - 1].chars().last().unwrap();
+            let (internal, mismatches) = oatk_oriented_overlap(
+                graph, previous, previous_orient, node, orient, false,
+            )?;
+            internal_mismatches += mismatches;
+            boundary_offsets.push(sequence.len());
+            sequence.push_str(&part[internal..]);
+        }
+    }
+    let first = &merged.ordered_nodes[0];
+    let last = merged.ordered_nodes.last().unwrap();
+    let first_orient = merged.oriented_nodes[0].chars().last().unwrap();
+    let last_orient = merged.oriented_nodes.last().unwrap().chars().last().unwrap();
+    let (overlap, _) = oatk_oriented_overlap(
+        graph, last, last_orient, first, first_orient, true,
+    )?;
+    merged.sequence = sequence;
+    merged.boundary_offsets = boundary_offsets;
+    merged.internal_overlap_mismatch_bp = internal_mismatches;
+    if overlap == 0 {
+        return Ok(merged);
+    }
+    if overlap >= merged.sequence.len()
+        || merged.sequence[merged.sequence.len() - overlap..] != merged.sequence[..overlap]
+    {
+        return Err(OrgraftError::InvalidArgument(
+            "Oatk circular closing overlap does not exactly match the selected path ends"
+                .to_string(),
+        ));
+    }
+    merged.sequence.truncate(merged.sequence.len() - overlap);
+    merged.closing_overlap_trimmed_bp = overlap;
+    Ok(merged)
+}
+
+fn exact_two_node_oatk_circle(
+    graph: &GfaGraph,
+    placements: &[NodePlacement],
+) -> Option<MergedSequence> {
+    if graph.segments.len() != 2
+        || graph.links.len() != 2
+        || placements.len() != 2
+        || !graph_is_circular_subgraph(graph)
+    {
+        return None;
+    }
+    for placement in placements {
+        if oatk_oriented_sequence(graph, &placement.node_id, placement.orientation).ok()?
+            != placement.sequence
+        {
+            return None;
+        }
+    }
+    let merged = MergedSequence {
+        sequence: String::new(),
+        ordered_nodes: placements.iter().map(|p| p.node_id.clone()).collect(),
+        oriented_nodes: placements
+            .iter()
+            .map(|p| format!("{}{}", p.node_id, p.orientation))
+            .collect(),
+        boundary_offsets: Vec::new(),
+        closing_overlap_trimmed_bp: 0,
+        internal_overlap_mismatch_bp: 0,
+    };
+    let corrected = maybe_trim_oatk_closing_overlap(graph, merged, true).ok()?;
+    (corrected.closing_overlap_trimmed_bp > 0 && corrected.internal_overlap_mismatch_bp == 0)
+        .then_some(corrected)
+}
+
+fn oatk_unresolved_circle_at_fallback(
+    graph: &GfaGraph,
+    ready_repeat_nodes: &[String],
+    exact_circle_found: bool,
+) -> bool {
+    !ready_repeat_nodes.is_empty() || (graph_is_circular_subgraph(graph) && !exact_circle_found)
 }
 
 fn graph_traversal_order(graph: &GfaGraph) -> Result<Vec<String>, OrgraftError> {
@@ -3224,11 +3431,24 @@ fn build_reference_indexes(records: &[FastaRecord]) -> Vec<ReferenceKmerIndex> {
 fn score_candidates_against_references(
     candidates: &[AutoRepeatCandidate],
     references: &[ReferenceKmerIndex],
+    oatk_closing_overlap: bool,
 ) -> Result<Vec<CandidateScore>, OrgraftError> {
     let mut scores = Vec::new();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
-        let candidate_sequence =
-            gfa_editor_merge_all_sequence(&candidate.graph)?.to_ascii_uppercase();
+        let candidate_sequence = if oatk_closing_overlap {
+            if !candidate.circular || !graph_is_circular_subgraph(&candidate.graph) {
+                continue;
+            }
+            let merged = match merge_graph_to_sequence(&candidate.graph)
+                .and_then(|merged| maybe_trim_oatk_closing_overlap(&candidate.graph, merged, true))
+            {
+                Ok(merged) if merged.internal_overlap_mismatch_bp == 0 => merged,
+                _ => continue,
+            };
+            merged.sequence.to_ascii_uppercase()
+        } else {
+            gfa_editor_merge_all_sequence(&candidate.graph)?.to_ascii_uppercase()
+        };
         let mut best_for_candidate: Option<CandidateScore> = None;
         for reference in references {
             let sequence_score = score_sequence_arrangement(
@@ -3636,6 +3856,7 @@ fn resolve_component_with_gfa_editor_cli(
     max_states: usize,
     max_candidates: usize,
     ready_repeat_nodes: Vec<String>,
+    oatk_closing_overlap: bool,
 ) -> Result<(FastaRecord, SubgraphResolution), OrgraftError> {
     let input_gfa = temp_file_path("orgraft-resolve-gfa-editor-input", "gfa");
     let resolved_gfa = temp_file_path("orgraft-resolve-gfa-editor-resolved", "gfa");
@@ -3673,7 +3894,8 @@ fn resolve_component_with_gfa_editor_cli(
 
     let summary = parse_gfa_editor_summary(&summary_json)?;
     let resolved_graph = GfaGraph::read(&resolved_gfa)?;
-    let merged = merge_graph_to_sequence(&resolved_graph)?;
+    let untrimmed = merge_graph_to_sequence(&resolved_graph)?;
+    let merged = maybe_trim_oatk_closing_overlap(&resolved_graph, untrimmed, oatk_closing_overlap)?;
     let record = FastaRecord {
         id: component.id.clone(),
         sequence: merged.sequence.clone(),
@@ -3690,6 +3912,8 @@ fn resolve_component_with_gfa_editor_cli(
         candidate_count: summary.candidate_count,
         selected_candidate: summary.selected_candidate,
         selected_circular: graph_is_circular_subgraph(&resolved_graph),
+        closing_overlap_trimmed_bp: merged.closing_overlap_trimmed_bp,
+        internal_overlap_mismatch_bp: merged.internal_overlap_mismatch_bp,
         selected_order: summary.selected_order,
         score_method: summary.score_method,
         score_value: summary.score_value,
@@ -3814,6 +4038,7 @@ fn build_reference_ordered_subgraph_fasta(
     max_candidates: usize,
     gfa_editor_mode: GfaEditorMode,
     gfa_editor_cli: Option<&Path>,
+    oatk_closing_overlap: bool,
 ) -> Result<RepeatResolutionResult, OrgraftError> {
     let component_report = graph.component_report();
     let reference_records = read_fasta(reference_fasta)?;
@@ -3862,6 +4087,7 @@ fn build_reference_ordered_subgraph_fasta(
                         max_states,
                         max_candidates,
                         ready_repeat_nodes.clone(),
+                        oatk_closing_overlap,
                     )?;
                     records.push(record);
                     resolutions.push(resolution);
@@ -3874,7 +4100,16 @@ fn build_reference_ordered_subgraph_fasta(
                 max_candidates,
             )?;
             if !candidates.is_empty() {
-                let scores = score_candidates_against_references(&candidates, &reference_indexes)?;
+                let scores = score_candidates_against_references(
+                    &candidates,
+                    &reference_indexes,
+                    oatk_closing_overlap,
+                )?;
+                if oatk_closing_overlap && scores.is_empty() {
+                    return Err(OrgraftError::InvalidArgument(
+                        "no Oatk repeat candidate has an exact oriented circular path".to_string(),
+                    ));
+                }
                 if let Some(best_score) = best_candidate_score(&scores) {
                     let selected = candidates
                         .iter()
@@ -3885,7 +4120,18 @@ fn build_reference_ordered_subgraph_fasta(
                                 best_score.candidate_id
                             ))
                         })?;
-                    let merged = merge_graph_to_sequence(&selected.graph)?;
+                    let untrimmed = merge_graph_to_sequence(&selected.graph)?;
+                    let merged = maybe_trim_oatk_closing_overlap(
+                        &selected.graph,
+                        untrimmed,
+                        oatk_closing_overlap,
+                    )?;
+                    if oatk_closing_overlap && merged.internal_overlap_mismatch_bp != 0 {
+                        return Err(OrgraftError::InvalidArgument(
+                            "selected Oatk repeat candidate has inexact internal overlaps"
+                                .to_string(),
+                        ));
+                    }
                     records.push(FastaRecord {
                         id: component.id.clone(),
                         sequence: merged.sequence.clone(),
@@ -3902,6 +4148,8 @@ fn build_reference_ordered_subgraph_fasta(
                         candidate_count: candidates.len(),
                         selected_candidate: selected.id.clone(),
                         selected_circular: selected.circular,
+                        closing_overlap_trimmed_bp: merged.closing_overlap_trimmed_bp,
+                        internal_overlap_mismatch_bp: merged.internal_overlap_mismatch_bp,
                         selected_order: selected
                             .order
                             .iter()
@@ -3959,10 +4207,42 @@ fn build_reference_ordered_subgraph_fasta(
             }
             .then_with(|| natural_cmp(&left.node_id, &right.node_id))
         });
-        let sequence = placements
-            .iter()
-            .map(|placement| placement.sequence.as_str())
-            .collect::<String>();
+        let exact_circle = if oatk_closing_overlap
+            && component_graph.segments.len() == 2
+            && component_graph.links.len() == 2
+            && graph_is_circular_subgraph(&component_graph)
+        {
+            Some(
+                exact_two_node_oatk_circle(&component_graph, &placements).ok_or_else(|| {
+                    OrgraftError::InvalidArgument(
+                        "Oatk two-node circle lacks two exact oriented nM overlaps".to_string(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        if oatk_closing_overlap
+            && oatk_unresolved_circle_at_fallback(
+                &component_graph,
+                &ready_repeat_nodes,
+                exact_circle.is_some(),
+            )
+        {
+            return Err(OrgraftError::InvalidArgument(
+                "Oatk circular graph has no verified exact resolve path".to_string(),
+            ));
+        }
+        let sequence = exact_circle
+            .as_ref()
+            .map(|merged| merged.sequence.clone())
+            .unwrap_or_else(|| {
+                placements
+                    .iter()
+                    .map(|placement| placement.sequence.as_str())
+                    .collect::<String>()
+            });
+        let resolved_bp = sequence.len();
         records.push(FastaRecord {
             id: component.id.clone(),
             sequence,
@@ -3999,14 +4279,27 @@ fn build_reference_ordered_subgraph_fasta(
             unresolved_node_count: component.node_ids.len(),
             unresolved_total_bp: component.total_bp,
             node_count: component.node_ids.len(),
-            total_bp: component.total_bp,
+            total_bp: if exact_circle.is_some() {
+                resolved_bp
+            } else {
+                component.total_bp
+            },
             resolution_engine: "rust".to_string(),
             ready_repeat_nodes,
             candidate_count: 0,
             selected_candidate: ".".to_string(),
-            selected_circular: false,
+            selected_circular: exact_circle.is_some(),
+            closing_overlap_trimmed_bp: exact_circle
+                .as_ref()
+                .map_or(0, |merged| merged.closing_overlap_trimmed_bp),
+            internal_overlap_mismatch_bp: 0,
             selected_order: Vec::new(),
-            score_method: "reference-placement-fallback".to_string(),
+            score_method: if exact_circle.is_some() {
+                "oatk-two-node-exact-circle"
+            } else {
+                "reference-placement-fallback"
+            }
+            .to_string(),
             score_value: None,
             score_orientation: None,
             length_delta: None,
@@ -4624,6 +4917,14 @@ fn write_resolve_details(
         options.gfa_editor_mode.as_str(),
         "",
     )?;
+    write_detail(
+        &mut out,
+        "run",
+        ".",
+        "oatk_closing_overlap",
+        options.oatk_closing_overlap,
+        "opt-in; trims only a verified selected circular closing edge",
+    )?;
     write_detail(&mut out, "run", ".", "report", paths.report.display(), "")?;
     write_detail(&mut out, "run", ".", "id_map", paths.id_map.display(), "")?;
     write_detail(&mut out, "run", ".", "details", paths.details.display(), "")?;
@@ -5028,6 +5329,22 @@ fn write_resolve_details(
             "selected_circular",
             subgraph.selected_circular,
             "",
+        )?;
+        write_detail(
+            &mut out,
+            "resolution",
+            &subgraph.subgraph_id,
+            "closing_overlap_trimmed_bp",
+            subgraph.closing_overlap_trimmed_bp,
+            "0 when the opt-in correction did not apply",
+        )?;
+        write_detail(
+            &mut out,
+            "resolution",
+            &subgraph.subgraph_id,
+            "internal_overlap_mismatch_bp",
+            subgraph.internal_overlap_mismatch_bp,
+            "mismatched bases in selected Oatk internal nM alignments",
         )?;
         write_detail(
             &mut out,
@@ -5831,5 +6148,309 @@ mod tests {
         assert!(segment.tags.contains(&"AB:i:30".to_string()));
         assert!(segment.tags.contains(&"AC:i:6".to_string()));
         assert!(segment.tags.contains(&"SC:Z:preserved_node".to_string()));
+    }
+
+    #[test]
+    fn compaction_preserves_explicit_singleton_self_links_and_sequence() {
+        for (from, to, overlap) in [
+            ('+', '+', "0M"),
+            ('-', '-', "3M"),
+            ('+', '-', "2M"),
+            ('-', '+', "2M"),
+        ] {
+            let raw = GfaGraph::parse(
+                &format!("S\tx\tACGTTACG\nL\tx\t{from}\tx\t{to}\t{overlap}\tRC:i:17\n"),
+                Path::new("checked.gfa"),
+            )
+            .unwrap();
+            let (merged, _, _) = merge_unambiguous_gfa(&raw);
+            assert_eq!(merged.segments.len(), 1);
+            assert_eq!(merged.links.len(), 1);
+            let link = &merged.links[0];
+            assert_eq!(
+                (
+                    &link.from_name,
+                    link.from_orient,
+                    &link.to_name,
+                    link.to_orient
+                ),
+                (&"x".to_string(), from, &"x".to_string(), to)
+            );
+            assert_eq!(link.overlap, overlap);
+            assert_eq!(link.tags, vec!["RC:i:17"]);
+            assert_eq!(merged.segments["x"].sequence, raw.segments["x"].sequence);
+            // Closing-overlap normalization remains a separate operation; preserve the old FASTA.
+            assert_eq!(
+                merge_graph_to_sequence(&merged).unwrap().sequence,
+                "ACGTTACG"
+            );
+            assert!(auto_repeat_ready_node_ids(&merged).is_empty());
+        }
+    }
+
+    #[test]
+    fn compaction_does_not_infer_self_link_from_singleton_sequence() {
+        let raw = GfaGraph::parse("S\tx\tACGTTACG\n", Path::new("checked.gfa")).unwrap();
+        let (merged, _, _) = merge_unambiguous_gfa(&raw);
+        assert!(merged.links.is_empty());
+        assert_eq!(
+            merge_graph_to_sequence(&merged).unwrap().sequence,
+            "ACGTTACG"
+        );
+    }
+
+    #[test]
+    fn compaction_still_absorbs_links_between_merged_distinct_nodes() {
+        let raw = GfaGraph::parse(
+            "S\ta\tACGT\nS\tb\tTGCA\nL\ta\t+\tb\t+\t0M\n",
+            Path::new("checked.gfa"),
+        )
+        .unwrap();
+        let (merged, _, _) = merge_unambiguous_gfa(&raw);
+        assert_eq!(merged.segments.len(), 1);
+        assert_eq!(merged.segments["a_b"].sequence, "ACGTTGCA");
+        assert!(merged.links.is_empty());
+    }
+
+    #[test]
+    fn merged_and_split_exports_keep_checked_self_link_only_in_its_component() {
+        let raw = GfaGraph::parse(
+            "S\tcircle\tACGTTACG\nS\tlinear\tTTTA\nL\tcircle\t-\tcircle\t-\t3M\tRC:i:17\n",
+            Path::new("checked.gfa"),
+        )
+        .unwrap();
+        let dir = temp_file_path("resolve-self-link-export", "dir");
+        let merged_path = dir.join("merged_unresolved.gfa");
+        let prepared = prepare_graph_in_rust(&raw, &merged_path).unwrap();
+        assert_eq!(prepared.input_links, 1);
+        assert_eq!(prepared.merged_links, 1);
+        let merged = GfaGraph::read(&merged_path).unwrap();
+        let files = write_component_gfas(&merged, &dir).unwrap();
+        assert_eq!(files.len(), 2);
+        for path in files {
+            let component = GfaGraph::read(&path).unwrap();
+            let segment = component.ordered_segments()[0];
+            assert_eq!(segment.sequence, raw.segments[&segment.name].sequence);
+            if segment.name == "circle" {
+                assert_eq!(component.links.len(), 1);
+                assert_eq!(component.links[0].from_orient, '-');
+                assert_eq!(component.links[0].to_orient, '-');
+                assert_eq!(component.links[0].overlap, "3M");
+                assert_eq!(component.links[0].tags, vec!["RC:i:17"]);
+            } else {
+                assert!(component.links.is_empty());
+            }
+            let fasta_path = path.with_extension("fasta");
+            component.write_fasta(&fasta_path).unwrap();
+            assert_eq!(
+                read_fasta(&fasta_path).unwrap()[0].sequence,
+                segment.sequence
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oatk_closing_overlap_trims_only_a_verified_selected_circle() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTTC\nS\tc\tTCAAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\tc\t+\t2M\nL\tc\t+\ta\t+\t2M\n",
+            Path::new("oatk.gfa"),
+        )
+        .unwrap();
+        assert!(graph_is_circular_subgraph(&graph));
+        let original = merge_graph_to_sequence(&graph).unwrap();
+        assert_eq!(original.sequence, "AAACGTTCAAA");
+        assert_eq!(
+            maybe_trim_oatk_closing_overlap(&graph, original.clone(), false)
+                .unwrap()
+                .sequence,
+            original.sequence
+        );
+        let corrected = maybe_trim_oatk_closing_overlap(&graph, original, true).unwrap();
+        assert_eq!(corrected.sequence, "AAACGTTCA");
+        assert_eq!(corrected.ordered_nodes, vec!["a", "b", "c"]);
+        assert_eq!(corrected.boundary_offsets, vec![0, 5, 8]);
+    }
+
+    #[test]
+    fn oatk_two_node_circle_uses_the_oriented_internal_link() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTAAA\nL\tb\t+\ta\t+\t3M\nL\ta\t+\tb\t+\t2M\n",
+            Path::new("oatk.gfa"),
+        )
+        .unwrap();
+        assert!(graph_is_circular_subgraph(&graph));
+        let legacy = merge_graph_to_sequence(&graph).unwrap();
+        assert_eq!(legacy.sequence, "AAACGAAA");
+        let corrected = maybe_trim_oatk_closing_overlap(&graph, legacy, true).unwrap();
+        assert_eq!(corrected.sequence, "AAACGT");
+        assert_eq!(corrected.boundary_offsets, vec![0, 5]);
+        assert_eq!(corrected.closing_overlap_trimmed_bp, 3);
+    }
+
+    #[test]
+    fn oatk_internal_m_allows_and_reports_base_mismatches() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCTAAAA\nL\tb\t+\ta\t+\t3M\nL\ta\t+\tb\t+\t2M\n",
+            Path::new("oatk.gfa"),
+        )
+        .unwrap();
+        let legacy = merge_graph_to_sequence(&graph).unwrap();
+        let corrected = maybe_trim_oatk_closing_overlap(&graph, legacy, true).unwrap();
+        assert_eq!(corrected.sequence, "AAACGA");
+        assert_eq!(corrected.internal_overlap_mismatch_bp, 1);
+        assert_eq!(corrected.closing_overlap_trimmed_bp, 3);
+    }
+
+    #[test]
+    fn oatk_closing_overlap_rejects_a_declared_but_inexact_edge() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTTC\nS\tc\tTCAAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\tc\t+\t2M\nL\tc\t+\ta\t+\t4M\n",
+            Path::new("oatk.gfa"),
+        )
+        .unwrap();
+        let merged = merge_graph_to_sequence(&graph).unwrap();
+        assert!(maybe_trim_oatk_closing_overlap(&graph, merged, true)
+            .unwrap_err()
+            .to_string()
+            .contains("does not exactly match"));
+    }
+
+    #[test]
+    fn oatk_closing_overlap_may_cross_the_last_node_boundary() {
+        let graph = GfaGraph::parse(
+            "S\ta\tCAACG\nS\tb\tCGTTC\nS\tc\tTCAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\tc\t+\t2M\nL\tc\t+\ta\t+\t3M\n",
+            Path::new("oatk.gfa"),
+        )
+        .unwrap();
+        let merged = merge_graph_to_sequence(&graph).unwrap();
+        assert_eq!(merged.sequence, "CAACGTTCAA");
+        assert_eq!(merged.boundary_offsets, vec![0, 5, 8]);
+        assert_eq!(
+            maybe_trim_oatk_closing_overlap(&graph, merged, true)
+                .unwrap()
+                .sequence,
+            "CAACGTT"
+        );
+    }
+
+    #[test]
+    fn oatk_candidate_scoring_uses_the_verified_final_circle() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTTC\nS\tc\tTCAAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\tc\t+\t2M\nL\tc\t+\ta\t+\t2M\n",
+            Path::new("oatk-candidate.gfa"),
+        )
+        .unwrap();
+        let candidate = AutoRepeatCandidate {
+            id: "circle".into(),
+            graph,
+            order: Vec::new(),
+            signature: String::new(),
+            circular: true,
+            merged_order_count: 1,
+        };
+        let references = build_reference_indexes(&[FastaRecord {
+            id: "reference".into(),
+            sequence: "AAACGTTCA".into(),
+        }]);
+        let legacy =
+            score_candidates_against_references(&[candidate.clone()], &references, false).unwrap();
+        let corrected =
+            score_candidates_against_references(&[candidate], &references, true).unwrap();
+        assert_eq!(legacy[0].length_delta, 2);
+        assert_eq!(corrected[0].length_delta, 0);
+        assert_eq!(corrected[0].method, "sequence-exact-circular");
+    }
+
+    #[test]
+    fn oatk_two_node_fallback_requires_an_exact_oriented_circle() {
+        let graph = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTAAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\ta\t+\t3M\n",
+            Path::new("two-node.gfa"),
+        )
+        .unwrap();
+        let placements = vec![
+            NodePlacement {
+                node_id: "a".into(),
+                reference_alias: None,
+                reference_start: None,
+                orientation: '+',
+                sequence: "AAACG".into(),
+            },
+            NodePlacement {
+                node_id: "b".into(),
+                reference_alias: None,
+                reference_start: None,
+                orientation: '+',
+                sequence: "CGTAAA".into(),
+            },
+        ];
+        let corrected = exact_two_node_oatk_circle(&graph, &placements).unwrap();
+        assert_eq!(corrected.sequence, "AAACGT");
+        assert_eq!(corrected.closing_overlap_trimmed_bp, 3);
+        assert_eq!(corrected.internal_overlap_mismatch_bp, 0);
+        assert!(oatk_unresolved_circle_at_fallback(&graph, &[], false));
+        assert!(!oatk_unresolved_circle_at_fallback(&graph, &[], true));
+
+        let internal_mismatch = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCTAAAA\nL\ta\t+\tb\t+\t2M\nL\tb\t+\ta\t+\t3M\n",
+            Path::new("internal-mismatch.gfa"),
+        )
+        .unwrap();
+        let mut changed = placements.clone();
+        changed[1].sequence = "CTAAAA".into();
+        assert!(exact_two_node_oatk_circle(&internal_mismatch, &changed).is_none());
+
+        let closing_mismatch = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tCGTTTT\nL\ta\t+\tb\t+\t2M\nL\tb\t+\ta\t+\t3M\n",
+            Path::new("closing-mismatch.gfa"),
+        )
+        .unwrap();
+        changed[1].sequence = "CGTTTT".into();
+        assert!(exact_two_node_oatk_circle(&closing_mismatch, &changed).is_none());
+
+        for (name, links) in [
+            ("open", "L\ta\t+\tb\t+\t2M\n"),
+            (
+                "duplicate",
+                "L\ta\t+\tb\t+\t2M\nL\ta\t+\tb\t+\t2M\nL\tb\t+\ta\t+\t3M\n",
+            ),
+            (
+                "unsupported-cigar",
+                "L\ta\t+\tb\t+\t2=\nL\tb\t+\ta\t+\t3M\n",
+            ),
+        ] {
+            let input = format!("S\ta\tAAACG\nS\tb\tCGTAAA\n{links}");
+            let graph = GfaGraph::parse(&input, Path::new(name)).unwrap();
+            assert!(exact_two_node_oatk_circle(&graph, &placements).is_none());
+        }
+
+        let reversed = GfaGraph::parse(
+            "S\ta\tAAACG\nS\tb\tTTTACG\nL\tb\t+\ta\t-\t2M\nL\ta\t-\tb\t+\t3M\n",
+            Path::new("reversed.gfa"),
+        )
+        .unwrap();
+        let mut reversed_placements = placements.clone();
+        reversed_placements[1].orientation = '-';
+        assert_eq!(
+            exact_two_node_oatk_circle(&reversed, &reversed_placements)
+                .unwrap()
+                .sequence,
+            "AAACGT"
+        );
+    }
+
+    #[test]
+    fn oatk_option_rejects_cli_mode() {
+        let mut args = vec![
+            "--checked-draft-gfa".to_string(),
+            "x.gfa".to_string(),
+            "--reference".to_string(),
+            "x.fa".to_string(),
+            "--oatk-closing-overlap".to_string(),
+        ];
+        assert!(ResolveOptions::from_args(&args).is_ok());
+        args.extend(["--gfa-editor-mode".to_string(), "cli".to_string()]);
+        assert!(ResolveOptions::from_args(&args).is_err());
     }
 }
