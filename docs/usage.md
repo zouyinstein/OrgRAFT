@@ -778,3 +778,30 @@ pass the existing complete-family HSP, exact-copy, four-template, 2000-bp flank
 and 1000-bp anchor checks. Failure requires review rather than falling back to
 a different span. The entire original component query library is measured
 fresh; target and non-target adoption gates remain unchanged.
+
+## Version and Reproducibility
+
+The current package version is 0.5.0. Record the complete source commit, package
+version, compiled executable checksum, external-tool versions, TOML, and explicit
+review inputs when starting a new analysis. `Cargo.lock` pins the Rust package
+resolution; `soft_paths.txt` records host-specific tool locations.
+
+```bash
+git rev-parse HEAD
+cargo build --release --locked
+./target/release/orgraft --version
+```
+
+Version 0.5.0 was prepared after the recorded rerun audit. Its scientific Rust
+sources and required test fixtures are identical to the audited 0.4.2 source
+snapshot, recorded in commit `e40358ecdc01af41eed0fd5080f364e0a07bfe25`.
+The 0.5.0 update changes package metadata and user documentation. Historical
+outputs retain the executable and source identities recorded by their own
+commands, logs, and receipts; a later package version does not relabel those runs.
+
+A rerun from a fixed read pool must preserve that input and its provenance.
+This is distinct from repeating the original recruitment from whole-genome
+reads. Report the original recruitment version, parameters, and seed only when
+they were recorded. A current default is not evidence of a historical setting.
+The reference and explicit review decisions remain declared inputs; reference-
+assisted agreement is not an independent accuracy benchmark.

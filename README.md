@@ -1,5 +1,7 @@
 # OrgRAFT
 
+Version **0.5.0**.
+
 OrgRAFT means **Organelle Read-backed Assembly with FASTA–Graph Traceability**.
 
 This repository contains a Rust CLI for plant organelle assembly and
@@ -16,6 +18,21 @@ into two files:
   output layout, and smoke tests.
 - [docs/design.md](docs/design.md): architecture, file contracts, rebuild
   outputs, topology assumptions, and external-tool boundaries.
+
+## Version 0.5.0
+
+This version includes native `postrepair` and `refine` commands, TOML-driven
+execution, and source and evidence checks between stages. Runtime execution uses
+the OrgRAFT CLI and the declared external tools. AI services and development
+scripts are not required. Cases with inconclusive evidence retain an explicit
+manual-review checkpoint.
+
+With reviewed draft graphs from another assembler, disable recruitment and
+assembly in the TOML and run stages 03–07. Previously validated curated inputs
+can continue from postrepair through stages 05–07. Supply the recorded reads,
+source graph, reference, and any explicit review decisions required by that
+starting point. `resolve` uses the supplied reference to rank and orient
+candidate sequences.
 
 ## Commands
 
@@ -87,7 +104,7 @@ generate this standalone repair command.
 
 ```bash
 cargo test
-cargo build --release
+cargo build --release --locked
 export ORGRAFT_BIN="$PWD/target/release/orgraft"
 
 "$ORGRAFT_BIN" --help
@@ -158,6 +175,7 @@ scripts, especially polish validation plotting.
 
 ## Status
 
-OrgRAFT is an active internal Rust CLI. Heavy alignment and visualization are
-delegated to mature external tools where that remains the most reliable
-boundary.
+OrgRAFT 0.5.0 is a Rust CLI for plant organelle assembly and finishing.
+Alignment and optional graph visualization use the external tools declared in
+`soft_paths.txt`. See the [version and reproducibility notes](docs/usage.md#version-and-reproducibility)
+for source identification and the interpretation of historical runs.
